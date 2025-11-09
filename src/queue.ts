@@ -24,7 +24,7 @@ interface GenericStatement {
 }
 
 export interface Connection {
-  driver: "bun:sqlite" | "better-sqlite3";
+  driver: string;
   filename: string;
   pragma: (stmt: string) => void;
   exec: (stmt: string) => void;
