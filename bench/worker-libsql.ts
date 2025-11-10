@@ -1,8 +1,8 @@
-import Database from "libsql";
-import { defineQueue, defineWorker } from "../src/plainjob";
 import type { Job, Logger } from "../src/plainjob";
+import { defineQueue, defineWorker } from "../src/plainjob";
+import { libsql, setupQueueDeps } from "../src/queue";
 import { processAll } from "../src/worker";
-import { libsql } from "../src/queue";
+import { createDb } from "./libsql";
 
 const logger: Logger = {
   error: console.error,
@@ -11,22 +11,18 @@ const logger: Logger = {
   debug: () => {},
 };
 
-const filename = process.argv[2];
-
-if (!filename) {
-  console.error("invalid database url specified");
-  process.exit(1);
-}
-
-const connection = libsql(new Database(filename));
-
-const queue = defineQueue({ connection, logger });
-const worker = defineWorker("bench", async (job: Job) => Promise.resolve(), {
-  queue,
-  logger,
-});
-
 async function run() {
+  const connection = libsql(createDb());
+
+  await setupQueueDeps(connection);
+
+  const queue = defineQueue({ connection, logger });
+
+  const worker = defineWorker("bench", async (_job: Job) => Promise.resolve(), {
+    queue,
+    logger,
+  });
+
   await processAll(queue, worker, { logger, timeout: 60 * 1000 });
   queue.close();
   process.exit(0);

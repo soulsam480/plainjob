@@ -1,5 +1,5 @@
 import cronParser from "cron-parser";
-import { JobStatus, type Job, type Logger, type PersistedJob } from "./jobs";
+import { type Job, JobStatus, type Logger, type PersistedJob } from "./jobs";
 import type { Queue } from "./queue";
 
 /** Function that processes a job and optionally returns a promise. */
@@ -44,7 +44,8 @@ export function defineWorker(
 
   async function processScheduledJobs() {
     log.debug(`worker [${id}] checking for scheduled jobs`);
-    const scheduledJob = queue.getAndMarkScheduledJobAsProcessing();
+    const scheduledJob = await queue.getAndMarkScheduledJobAsProcessing();
+
     if (scheduledJob) {
       log.debug(
         `worker [${id}] processing scheduled job '${scheduledJob.id}' '${scheduledJob.type}'`,
@@ -54,11 +55,13 @@ export function defineWorker(
         .next()
         .toDate()
         .getTime();
-      queue.markScheduledJobAsIdle(scheduledJob.id, nextRunAt);
+
+      await queue.markScheduledJobAsIdle(scheduledJob.id, nextRunAt);
+
       log.debug(
         `worker [${id}] marking scheduled job ${scheduledJob.id} as 'idle'`,
       );
-      queue.add(scheduledJob.type, {});
+      await queue.add(scheduledJob.type, {});
       log.debug(
         `worker [${id}] adding job '${scheduledJob.id}' '${scheduledJob.type}' from scheduled job`,
       );
@@ -70,11 +73,14 @@ export function defineWorker(
 
   async function processRegularJobs() {
     log.debug(`worker [${id}] checking for regular jobs`);
-    const jobId = queue.getAndMarkJobAsProcessing(jobType);
+
+    const jobId = await queue.getAndMarkJobAsProcessing(jobType);
+
     if (jobId) {
-      const job = queue.getJobById(jobId.id) as PersistedJob;
+      const job = (await queue.getJobById(jobId.id)) as PersistedJob;
       if (options.onProcessing) {
-        const job = queue.getJobById(jobId.id);
+        const job = await queue.getJobById(jobId.id);
+
         options.onProcessing(job!);
       }
       log.debug(
@@ -91,7 +97,7 @@ export function defineWorker(
         const errorMessage = `${(error as Error).stack}\n${
           (error as Error).message
         }`;
-        queue.markJobAsFailed(job.id, errorMessage);
+        await queue.markJobAsFailed(job.id, errorMessage);
         if (options.onFailed) {
           options.onFailed(job, errorMessage);
         }
@@ -164,9 +170,10 @@ export async function processAll(
   void worker.start();
   const start = Date.now();
   await new Promise((resolve) => setTimeout(resolve, 10));
+
   while (
-    queue.countJobs({ status: JobStatus.Pending }) +
-      queue.countJobs({ status: JobStatus.Processing }) >
+    (await queue.countJobs({ status: JobStatus.Pending })) +
+      (await queue.countJobs({ status: JobStatus.Processing })) >
     0
   ) {
     log.debug("waiting for jobs to be processed");
