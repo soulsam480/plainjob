@@ -24,10 +24,10 @@ export async function runScenario(
   connection: Connection,
   jobCount: number,
   concurrent: number,
-  parallel: number
+  parallel: number,
 ) {
   console.log(
-    `running scenario - jobs: ${jobCount}, workers: ${concurrent}, parallel workers: ${parallel}`
+    `running scenario - jobs: ${jobCount}, workers: ${concurrent}, parallel workers: ${parallel}`,
   );
 
   const queue = defineQueue({ connection, logger });
@@ -44,10 +44,10 @@ export async function runScenario(
     const worker = defineWorker(
       "bench",
       async (job: Job) => new Promise((resolve) => setTimeout(resolve, 0)),
-      { queue, logger }
+      { queue, logger },
     );
     workerPromises.push(
-      processAll(queue, worker, { logger, timeout: 60 * 1000 })
+      processAll(queue, worker, { logger, timeout: 60 * 1000 }),
     );
   }
 
@@ -61,14 +61,14 @@ export async function runScenario(
     throw new Error(
       `pending jobs remaining: ${queue.countJobs({
         status: JobStatus.Pending,
-      })}`
+      })}`,
     );
   }
   if (queue.countJobs({ status: JobStatus.Processing }) > 0) {
     throw new Error(
       `processing jobs remaining: ${queue.countJobs({
         status: JobStatus.Processing,
-      })}`
+      })}`,
     );
   }
 
@@ -88,13 +88,20 @@ export async function runScenario(
   return jobsPerSecond;
 }
 
+const WORKER_MAPPING: Record<string, string> = {
+  "better-sqlite3": "worker-better.ts",
+  "bun:sqlite": "worker-bun.ts",
+  libsql: "worker-libsql.ts",
+};
+
 function spawnWorkerProcess(connection: Connection): Promise<void> {
   return new Promise((resolve, reject) => {
     const workerPath = path.join(
       process.cwd(),
       "bench",
-      connection.driver === "bun:sqlite" ? "worker-bun.ts" : "worker-better.ts"
+      WORKER_MAPPING[connection.driver] ?? "",
     );
+
     const child: ChildProcess = fork(workerPath, [
       connection.filename,
       connection.driver,

@@ -31,7 +31,7 @@ type WorkerOptions = {
 export function defineWorker(
   jobType: string,
   processor: JobProcessor,
-  options: WorkerOptions
+  options: WorkerOptions,
 ): Worker {
   const log = options.logger || console;
   const id = Math.random().toString(36).substring(2, 15);
@@ -47,7 +47,7 @@ export function defineWorker(
     const scheduledJob = queue.getAndMarkScheduledJobAsProcessing();
     if (scheduledJob) {
       log.debug(
-        `worker [${id}] processing scheduled job '${scheduledJob.id}' '${scheduledJob.type}'`
+        `worker [${id}] processing scheduled job '${scheduledJob.id}' '${scheduledJob.type}'`,
       );
       const nextRunAt = cronParser
         .parseExpression(scheduledJob.cronExpression)
@@ -56,11 +56,11 @@ export function defineWorker(
         .getTime();
       queue.markScheduledJobAsIdle(scheduledJob.id, nextRunAt);
       log.debug(
-        `worker [${id}] marking scheduled job ${scheduledJob.id} as 'idle'`
+        `worker [${id}] marking scheduled job ${scheduledJob.id} as 'idle'`,
       );
       queue.add(scheduledJob.type, {});
       log.debug(
-        `worker [${id}] adding job '${scheduledJob.id}' '${scheduledJob.type}' from scheduled job`
+        `worker [${id}] adding job '${scheduledJob.id}' '${scheduledJob.type}' from scheduled job`,
       );
 
       return true;
@@ -78,7 +78,7 @@ export function defineWorker(
         options.onProcessing(job!);
       }
       log.debug(
-        `worker [${id}] processing job ${job.id}, ${job.type}, ${job.data}`
+        `worker [${id}] processing job ${job.id}, ${job.type}, ${job.data}`,
       );
       try {
         await processor({ id: job.id, data: job.data, type: job.type });
@@ -157,7 +157,7 @@ export function defineWorker(
 export async function processAll(
   queue: Queue,
   worker: Worker,
-  opts?: { logger?: Logger; timeout?: number }
+  opts?: { logger?: Logger; timeout?: number },
 ) {
   const log = opts?.logger || console;
   const timeout = opts?.timeout ?? 1000;

@@ -18,7 +18,7 @@ export function getTestSuite(
   beforeEach: BeforeEach,
   it: It,
   expect: Expect,
-  getConnection: () => Connection
+  getConnection: () => Connection,
 ) {
   describe("queue", async () => {
     let connection: Connection;
@@ -231,13 +231,13 @@ export function getTestSuite(
       queue.add("test3", { value: 3 });
 
       expect(
-        queue.countJobs({ type: "test1", status: JobStatus.Pending })
+        queue.countJobs({ type: "test1", status: JobStatus.Pending }),
       ).toBe(2);
       expect(
-        queue.countJobs({ type: "test2", status: JobStatus.Pending })
+        queue.countJobs({ type: "test2", status: JobStatus.Pending }),
       ).toBe(1);
       expect(
-        queue.countJobs({ type: "test1", status: JobStatus.Processing })
+        queue.countJobs({ type: "test1", status: JobStatus.Processing }),
       ).toBe(0);
       expect(queue.countJobs({ type: "test3" })).toBe(1);
       expect(queue.countJobs({ status: JobStatus.Pending })).toBe(4);
@@ -246,16 +246,16 @@ export function getTestSuite(
       const job = queue.getAndMarkJobAsProcessing("test1");
 
       expect(
-        queue.countJobs({ type: "test1", status: JobStatus.Processing })
+        queue.countJobs({ type: "test1", status: JobStatus.Processing }),
       ).toBe(1);
       expect(
-        queue.countJobs({ type: "test1", status: JobStatus.Pending })
+        queue.countJobs({ type: "test1", status: JobStatus.Pending }),
       ).toBe(1);
       expect(queue.countJobs({ status: JobStatus.Pending })).toBe(3);
 
       if (job) queue.markJobAsDone(job.id);
       expect(queue.countJobs({ type: "test1", status: JobStatus.Done })).toBe(
-        1
+        1,
       );
       expect(queue.countJobs({ status: JobStatus.Done })).toBe(1);
       expect(queue.countJobs({ type: "test5" })).toBe(0);
@@ -439,7 +439,7 @@ export function getTestSuite(
         async (job: Job) => {
           results.push(JSON.parse(job.data));
         },
-        { queue }
+        { queue },
       );
 
       queue.add("test", { value: 1 });
@@ -458,7 +458,7 @@ export function getTestSuite(
         async (job: Job) => {
           results.push(JSON.parse(job.data));
         },
-        { queue }
+        { queue },
       );
 
       queue.schedule("scheduled", { cron: "* * * * *" });
@@ -514,7 +514,7 @@ export function getTestSuite(
         async (job: Job) => {
           results.push(JSON.parse(job.data));
         },
-        { queue }
+        { queue },
       );
 
       await processAll(queue, worker);
@@ -532,7 +532,7 @@ export function getTestSuite(
         async (job: Job) => {
           throw new Error("test error");
         },
-        { queue }
+        { queue },
       );
 
       await processAll(queue, worker);
@@ -555,7 +555,7 @@ export function getTestSuite(
         async (job: Job) => {
           throw new Error("test error");
         },
-        { queue }
+        { queue },
       );
 
       worker.start();
@@ -621,7 +621,7 @@ export function getTestSuite(
             failedJob = job;
             failedError = error;
           },
-        }
+        },
       );
 
       queue.add("test", { value: "failed test" });
@@ -639,7 +639,7 @@ export function getTestSuite(
         async (job: Job) => {
           results.push(JSON.parse(job.data));
         },
-        { queue }
+        { queue },
       );
 
       const delay = 20;
@@ -650,7 +650,7 @@ export function getTestSuite(
 
       // we have to await here for vitest
       await expect(processAll(queue, worker, { timeout: 10 })).rejects.toThrow(
-        "timeout while waiting for all jobs the be processed"
+        "timeout while waiting for all jobs the be processed",
       );
 
       expect(results.length).toBe(1);
