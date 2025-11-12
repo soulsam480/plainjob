@@ -88,7 +88,7 @@ export function defineWorker(
       );
       try {
         await processor({ id: job.id, data: job.data, type: job.type });
-        queue.markJobAsDone(job.id);
+        await queue.markJobAsDone(job.id);
         if (options.onCompleted) {
           options.onCompleted(job);
         }

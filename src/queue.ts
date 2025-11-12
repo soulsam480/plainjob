@@ -92,7 +92,7 @@ export interface Connection {
 }
 
 function tapAndLogStatement(stmt: ISQLStatement) {
-  console.log(`[QUERY]: ${stmt.sql} with ${JSON.stringify(stmt.args)}`);
+  // console.log(`[QUERY]: ${stmt.sql} with ${JSON.stringify(stmt.args)}`);
 
   return stmt;
 }
@@ -375,13 +375,13 @@ export function defineQueue(opts: QueueOptions): Queue {
   `);
 
   const getJobIdToProcessNextStmt = db.prepare(sql`
-    SELECT id FROM plainjob_jobs
-    WHERE status = ${JobStatus.Pending} AND type = ?
+    SELECT id, created_at FROM plainjob_jobs
+    WHERE status = ${JobStatus.Pending} AND type = ? AND next_run_at <= ?
     ORDER BY next_run_at LIMIT 1
   `);
 
   const updateJobAsProcessingStmt = db.prepare(sql`
-    UPDATE plainjob_jobs SET status = ${JobStatus.Processing} WHERE id = ?
+    UPDATE plainjob_jobs SET status = ${JobStatus.Processing}, next_run_at = ? WHERE id = ?
   `);
 
   const getNextScheduledJobStmt = db.prepare(sql`
@@ -482,7 +482,7 @@ export function defineQueue(opts: QueueOptions): Queue {
         return { id: found.id };
       }
 
-      const result = await insertScheduledJobStmt.run(type, cron, now, now);
+      const result = await insertScheduledJobStmt.run(type, cron, 0, now);
       return { id: (result.rows[0] as PersistedJob)?.id };
     },
     async countJobs(opts?: {
@@ -551,13 +551,16 @@ export function defineQueue(opts: QueueOptions): Queue {
     ): Promise<{ id: number } | undefined> {
       const result = await getJobIdToProcessNextStmt.get<
         { id: number } | undefined
-      >(type);
+      >(type, Date.now());
 
       if (!result?.id) {
         return undefined;
       }
 
-      await updateJobAsProcessingStmt.run(result.id);
+      await updateJobAsProcessingStmt.run(
+        Date.now() + jobProcessingTimeout,
+        result.id,
+      );
 
       return result;
     },

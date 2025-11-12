@@ -49,6 +49,7 @@ export async function runScenario(
       async (_job: Job) => new Promise((resolve) => setTimeout(resolve, 0)),
       { queue, logger },
     );
+
     workerPromises.push(
       processAll(queue, worker, { logger, timeout: 60 * 1000 }),
     );
@@ -67,6 +68,7 @@ export async function runScenario(
       })}`,
     );
   }
+
   if ((await queue.countJobs({ status: JobStatus.Processing })) > 0) {
     throw new Error(
       `processing jobs remaining: ${queue.countJobs({
@@ -75,7 +77,7 @@ export async function runScenario(
     );
   }
 
-  await queue.close();
+  // await queue.close();
 
   const elapsed = Date.now() - start;
   const jobsPerSecond = jobCount / (elapsed / 1000);
@@ -91,8 +93,6 @@ export async function runScenario(
 }
 
 const WORKER_MAPPING: Record<string, string> = {
-  "better-sqlite3": "worker-better.ts",
-  "bun:sqlite": "worker-bun.ts",
   libsql: "worker-libsql.ts",
 };
 

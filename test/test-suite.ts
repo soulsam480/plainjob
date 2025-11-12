@@ -1,5 +1,4 @@
 import type { Expect } from "bun:test";
-import { afterAll, afterEach } from "vitest";
 import type { Job } from "../src/plainjob";
 import {
   defineQueue,
@@ -60,7 +59,7 @@ export function getTestSuite(
 
       expect(JSON.parse(job.data)).toEqual({ color: "red" });
 
-      queue.close();
+      await queue.close();
     });
 
     it("should add multiple jobs of the same type to the queue", async () => {
@@ -82,7 +81,7 @@ export function getTestSuite(
 
       expect(await queue.countJobs({ type: "paint" })).toBe(3);
 
-      queue.close();
+      await queue.close();
     });
 
     it("should add a job to the queue with a custom serializer", async () => {
@@ -113,7 +112,7 @@ export function getTestSuite(
       const parsedData = JSON.parse(job.data);
       expect(Object.fromEntries(parsedData)).toEqual({ a: 1, b: 2, c: 3 });
 
-      queue.close();
+      await queue.close();
     });
 
     it("should mark jobs as done or failed", async () => {
@@ -134,14 +133,18 @@ export function getTestSuite(
       const found = await queue.getJobById(failedJob.id);
       expect(found?.status).toBe(JobStatus.Failed);
       expect(found?.error).toBe("test error");
+
+      await queue.close();
     });
 
     it("should throw an error when adding a job with an invalid cron expression", async () => {
       const queue = defineQueue({ connection });
 
-      expect(async () => {
-        await queue.schedule("invalid", { cron: "invalid cron expression" });
-      }).rejects.toThrow("invalid cron expression provided");
+      await expect(() =>
+        queue.schedule("invalid", { cron: "invalid cron expression" }),
+      ).rejects.toThrow("invalid cron expression provided");
+
+      await queue.close();
     });
 
     it("should get and mark scheduled job as processing", async () => {
@@ -211,20 +214,20 @@ export function getTestSuite(
     it("should remove done jobs older than specified time", async () => {
       const queue = defineQueue({
         connection,
-        removeDoneJobsOlderThan: 20,
+        removeDoneJobsOlderThan: 500,
       });
 
       const { id: oldJobId } = await queue.add("test", { value: "old job" });
       const oldJob = await queue.getAndMarkJobAsProcessing("test");
       if (oldJob) await queue.markJobAsDone(oldJob.id);
 
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await new Promise((resolve) => setTimeout(resolve, 800));
 
       const { id: newJobId } = await queue.add("test", { value: "new job" });
       const newJob = await queue.getAndMarkJobAsProcessing("test");
       if (newJob) await queue.markJobAsDone(newJob.id);
 
-      await queue.removeDoneJobs(20);
+      await queue.removeDoneJobs(1300);
 
       expect(await queue.getJobById(oldJobId)).toBeUndefined();
       expect(await queue.getJobById(newJobId)).toBeDefined();
@@ -298,7 +301,7 @@ export function getTestSuite(
       expect(await queue.countJobs({ type: "test5" })).toBe(0);
       expect(await queue.countJobs()).toBe(4);
 
-      queue.close();
+      await queue.close();
     });
 
     it("should return all scheduled jobs", async () => {
@@ -318,7 +321,7 @@ export function getTestSuite(
       expect(scheduledJobs[1]?.cronExpression).toBe("0 0 * * *");
       expect(scheduledJobs[2]?.cronExpression).toBe("0 12 * * MON-FRI");
 
-      queue.close();
+      await queue.close();
     });
 
     it("should return an empty array when no scheduled jobs exist", async () => {
@@ -347,7 +350,7 @@ export function getTestSuite(
       expect(jobTypes).toContain("type2");
       expect(jobTypes).toContain("type3");
 
-      queue.close();
+      await queue.close();
     });
 
     it("should return an empty array when no jobs exist", async () => {
@@ -382,7 +385,7 @@ export function getTestSuite(
 
       expect(removedJobs).toBe(1);
 
-      queue.close();
+      await queue.close();
     });
 
     it("should call onFailedJobsRemoved when failed jobs are removed", async () => {
@@ -406,7 +409,7 @@ export function getTestSuite(
 
       expect(removedJobs).toBe(1);
 
-      queue.close();
+      await queue.close();
     });
 
     it("should call onProcessingJobsRequeued when processing jobs are requeued", async () => {
@@ -421,7 +424,7 @@ export function getTestSuite(
       });
 
       await queue.add("test", { value: "timeout test" });
-      queue.getAndMarkJobAsProcessing("test");
+      await queue.getAndMarkJobAsProcessing("test");
 
       await new Promise((resolve) => setTimeout(resolve, 20));
 
@@ -429,7 +432,7 @@ export function getTestSuite(
 
       expect(requeuedJobs).toBe(1);
 
-      queue.close();
+      await queue.close();
     });
 
     it("should update an existing scheduled job when adding the same type with a different cron expression", async () => {
@@ -457,273 +460,295 @@ export function getTestSuite(
       const updateTestJobs = allJobs.filter((job) => job.type === "updateTest");
       expect(updateTestJobs).toHaveLength(1);
 
-      queue.close();
+      await queue.close();
     });
   });
 
-  // describe("process queue and worker", async () => {
-  //   let connection: Connection;
-  //
-  //   beforeEach(async () => {
-  //     connection = getConnection();
-  //
-  //     await connection.exec(
-  //       "DROP INDEX IF EXISTS idx_jobs_status_type_next_run_at",
-  //     );
-  //
-  //     await connection.exec(
-  //       "DROP INDEX IF EXISTS idx_scheduled_jobs_status_type_next_run_at",
-  //     );
-  //
-  //     await connection.exec("DROP TABLE IF EXISTS plainjob_jobs");
-  //     await connection.exec("DROP TABLE IF EXISTS  plainjob_scheduled_jobs");
-  //
-  //     await setupQueueDeps(connection);
-  //   });
-  //
-  //   afterAll(() => {
-  //     connection?.close();
-  //   });
-  //
-  //   it("should process jobs with a worker", async () => {
-  //     const queue = defineQueue({ connection });
-  //     const results: unknown[] = [];
-  //     const worker = defineWorker(
-  //       "test",
-  //       async (job: Job) => {
-  //         results.push(JSON.parse(job.data));
-  //       },
-  //       { queue },
-  //     );
-  //
-  //     await queue.add("test", { value: 1 });
-  //     await queue.add("test", { value: 2 });
-  //
-  //     await processAll(queue, worker);
-  //
-  //     expect(results).toEqual([{ value: 1 }, { value: 2 }]);
-  //   });
-  //
-  //   it("should process scheduled jobs", async () => {
-  //     const queue = defineQueue({ connection });
-  //     const results: unknown[] = [];
-  //     const worker = defineWorker(
-  //       "scheduled",
-  //       async (job: Job) => {
-  //         results.push(JSON.parse(job.data));
-  //       },
-  //       { queue },
-  //     );
-  //
-  //     await queue.schedule("scheduled", { cron: "* * * * *" });
-  //
-  //     worker.start();
-  //     await worker.stop();
-  //
-  //     expect(results[0]).toEqual({});
-  //   });
-  //
-  //   it("should add a job with id and retrieve it", async () => {
-  //     const queue = defineQueue({ connection });
-  //
-  //     const { id } = await queue.add("paint", { color: "blue" });
-  //     expect(id).toBeDefined();
-  //
-  //     const job = await queue.getJobById(id);
-  //     expect(job).toBeDefined();
-  //     expect(job?.type).toBe("paint");
-  //     expect(JSON.parse(job?.data as string)).toEqual({ color: "blue" });
-  //
-  //     const worker = defineWorker("paint", async (job: Job) => {}, { queue });
-  //
-  //     await processAll(queue, worker);
-  //
-  //     const processedJob = await queue.getJobById(id);
-  //     expect(processedJob?.status).toBe(JobStatus.Done);
-  //     expect(processedJob?.type).toBe("paint");
-  //   });
-  //
-  //   it("should reprocess a job that has been stuck in processing for too long", async () => {
-  //     const queue = defineQueue({
-  //       connection,
-  //       timeout: 10,
-  //       maintenanceInterval: 40,
-  //     });
-  //
-  //     const { id } = await queue.add("test", { value: "timeout test" });
-  //
-  //     // simulate worker dying
-  //     const jobId = await queue.getAndMarkJobAsProcessing("test");
-  //     if (!jobId) throw new Error("Job not found");
-  //     const job = await queue.getJobById(jobId.id);
-  //     expect(job).toBeDefined();
-  //     expect(job?.id).toBe(id);
-  //     expect(job?.status).toBe(JobStatus.Processing);
-  //
-  //     await new Promise((resolve) => setTimeout(resolve, 70));
-  //
-  //     const results: unknown[] = [];
-  //     const worker = defineWorker(
-  //       "test",
-  //       async (job: Job) => {
-  //         results.push(JSON.parse(job.data));
-  //       },
-  //       { queue },
-  //     );
-  //
-  //     await processAll(queue, worker);
-  //
-  //     expect(results).toEqual([{ value: "timeout test" }]);
-  //   });
-  //
-  //   it("should store error information when a job fails", async () => {
-  //     const queue = defineQueue({ connection });
-  //
-  //     const { id } = await queue.add("test", { value: "error test" });
-  //
-  //     const worker = defineWorker(
-  //       "test",
-  //       async (job: Job) => {
-  //         throw new Error("test error");
-  //       },
-  //       { queue },
-  //     );
-  //
-  //     await processAll(queue, worker);
-  //
-  //     const failedJob = await queue.getJobById(id);
-  //     expect(failedJob).toBeDefined();
-  //     expect(failedJob?.status).toBe(JobStatus.Failed);
-  //     expect(failedJob?.failedAt).toBeDefined();
-  //     expect(failedJob?.failedAt).not.toBeNull();
-  //     expect(failedJob?.error).toContain("test error");
-  //   });
-  //
-  //   it("should store error information when a scheduled job fails", async () => {
-  //     const queue = defineQueue({ connection });
-  //
-  //     const { id } = await queue.schedule("paint", { cron: "* * * * * *" });
-  //
-  //     const worker = defineWorker(
-  //       "paint",
-  //       async (job: Job) => {
-  //         throw new Error("test error");
-  //       },
-  //       { queue },
-  //     );
-  //
-  //     worker.start();
-  //     await worker.stop();
-  //
-  //     const failedJob = await queue.getJobById(id);
-  //     expect(failedJob).toBeDefined();
-  //     expect(failedJob?.status).toBe(JobStatus.Failed);
-  //     expect(failedJob?.failedAt).toBeDefined();
-  //     expect(failedJob?.error).toContain("test error");
-  //     expect(failedJob?.failedAt).not.toBeNull();
-  //   });
-  //
-  //   it("should call onProcessing when a job starts processing", async () => {
-  //     const queue = defineQueue({ connection });
-  //     let processingCalled = false;
-  //
-  //     const worker = defineWorker("test", async (job: Job) => {}, {
-  //       queue,
-  //       onProcessing: (job: Job) => {
-  //         processingCalled = true;
-  //       },
-  //     });
-  //
-  //     await queue.add("test", { value: "processing test" });
-  //     await processAll(queue, worker);
-  //
-  //     expect(processingCalled).toBe(true);
-  //   });
-  //
-  //   it("should call onCompleted when a job is completed", async () => {
-  //     const queue = defineQueue({ connection });
-  //     let completedJob!: Job;
-  //
-  //     const worker = defineWorker("test", async (job: Job) => {}, {
-  //       queue,
-  //       onCompleted: (job: Job) => {
-  //         completedJob = job;
-  //       },
-  //     });
-  //
-  //     await queue.add("test", { value: "completed test" });
-  //     await processAll(queue, worker);
-  //
-  //     expect(JSON.parse(completedJob.data)).toEqual({
-  //       value: "completed test",
-  //     });
-  //   });
-  //
-  //   it("should call onFailed when a job fails", async () => {
-  //     const queue = defineQueue({ connection });
-  //     let failedJob!: Job;
-  //     let failedError!: string;
-  //
-  //     const worker = defineWorker(
-  //       "test",
-  //       async (job: Job) => {
-  //         throw new Error("Test error");
-  //       },
-  //       {
-  //         queue,
-  //         onFailed: (job: Job, error: string) => {
-  //           failedJob = job;
-  //           failedError = error;
-  //         },
-  //       },
-  //     );
-  //
-  //     await queue.add("test", { value: "failed test" });
-  //     await processAll(queue, worker);
-  //
-  //     expect(JSON.parse(failedJob.data)).toEqual({ value: "failed test" });
-  //     expect(failedError).toContain("Test error");
-  //   });
-  //
-  //   it("should delay job execution", async () => {
-  //     const queue = defineQueue({ connection });
-  //     const results: unknown[] = [];
-  //     const worker = defineWorker(
-  //       "delayed",
-  //       async (job: Job) => {
-  //         results.push(JSON.parse(job.data));
-  //       },
-  //       { queue },
-  //     );
-  //
-  //     const delay = 20;
-  //     const startTime = Date.now();
-  //
-  //     await queue.add("delayed", { value: "instant job" });
-  //     await queue.add("delayed", { value: "delayed job" }, { delay });
-  //
-  //     // we have to await here for vitest
-  //     await expect(processAll(queue, worker, { timeout: 10 })).rejects.toThrow(
-  //       "timeout while waiting for all jobs the be processed",
-  //     );
-  //
-  //     expect(results.length).toBe(1);
-  //     expect(results[0]).toEqual({ value: "instant job" });
-  //
-  //     await new Promise((resolve) => setTimeout(resolve, delay + 40));
-  //
-  //     await processAll(queue, worker);
-  //
-  //     const endTime = Date.now();
-  //
-  //     expect(results).toEqual([
-  //       { value: "instant job" },
-  //       {
-  //         value: "delayed job",
-  //       },
-  //     ]);
-  //
-  //     expect(endTime - startTime).toBeGreaterThanOrEqual(delay);
-  //   });
-  // });
+  describe("process queue and worker", async () => {
+    let connection: Connection;
+
+    beforeEach(async () => {
+      connection = getConnection();
+
+      await connection.exec(
+        "DROP INDEX IF EXISTS idx_jobs_status_type_next_run_at",
+      );
+
+      await connection.exec(
+        "DROP INDEX IF EXISTS idx_scheduled_jobs_status_type_next_run_at",
+      );
+
+      await connection.exec("DROP TABLE IF EXISTS plainjob_jobs");
+      await connection.exec("DROP TABLE IF EXISTS  plainjob_scheduled_jobs");
+
+      await setupQueueDeps(connection);
+    });
+
+    it("should process jobs with a worker", async () => {
+      const queue = defineQueue({ connection });
+
+      const results: unknown[] = [];
+      const worker = defineWorker(
+        "test",
+        async (job: Job) => {
+          results.push(JSON.parse(job.data));
+        },
+        { queue },
+      );
+
+      await queue.add("test", { value: 1 });
+      await queue.add("test", { value: 2 });
+
+      await processAll(queue, worker, { timeout: 5 * 1000 });
+
+      expect(results).toEqual([{ value: 1 }, { value: 2 }]);
+
+      await queue.close();
+    });
+
+    it("should process scheduled jobs", async () => {
+      const queue = defineQueue({ connection });
+
+      const results: unknown[] = [];
+
+      const worker = defineWorker(
+        "scheduled",
+        async (job: Job) => {
+          results.push(JSON.parse(job.data));
+        },
+        { queue },
+      );
+
+      await queue.schedule("scheduled", { cron: "*/1 * * * * *" });
+
+      void worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 2 * 1000));
+      await worker.stop();
+
+      expect(results[0]).toEqual({});
+
+      await queue.close();
+    });
+
+    it("should add a job with id and retrieve it", async () => {
+      const queue = defineQueue({ connection });
+
+      const { id } = await queue.add("paint", { color: "blue" });
+      expect(id).toBeDefined();
+
+      const job = await queue.getJobById(id);
+      expect(job).toBeDefined();
+      expect(job?.type).toBe("paint");
+      expect(JSON.parse(job?.data as string)).toEqual({ color: "blue" });
+
+      const worker = defineWorker("paint", async (job: Job) => {}, { queue });
+
+      await processAll(queue, worker);
+
+      const processedJob = await queue.getJobById(id);
+      expect(processedJob?.status).toBe(JobStatus.Done);
+      expect(processedJob?.type).toBe("paint");
+
+      await queue.close();
+    });
+
+    it("should reprocess a job that has been stuck in processing for too long", async () => {
+      const queue = defineQueue({
+        connection,
+        timeout: 200,
+        maintenanceInterval: 150,
+      });
+
+      const { id } = await queue.add("test", { value: "timeout test" });
+
+      // simulate worker dying
+      const jobId = await queue.getAndMarkJobAsProcessing("test");
+      if (!jobId) throw new Error("Job not found");
+      const job = await queue.getJobById(jobId.id);
+
+      expect(job).toBeDefined();
+      expect(job?.id).toBe(id);
+      expect(job?.status).toBe(JobStatus.Processing);
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      const results: unknown[] = [];
+      const worker = defineWorker(
+        "test",
+        async (job: Job) => {
+          results.push(JSON.parse(job.data));
+        },
+        { queue },
+      );
+
+      await processAll(queue, worker);
+
+      expect(results).toEqual([{ value: "timeout test" }]);
+
+      await queue.close();
+    });
+
+    it("should store error information when a job fails", async () => {
+      const queue = defineQueue({ connection });
+
+      const { id } = await queue.add("test", { value: "error test" });
+
+      const worker = defineWorker(
+        "test",
+        async (job: Job) => {
+          throw new Error("test error");
+        },
+        { queue },
+      );
+
+      await processAll(queue, worker);
+
+      const failedJob = await queue.getJobById(id);
+      expect(failedJob).toBeDefined();
+      expect(failedJob?.status).toBe(JobStatus.Failed);
+      expect(failedJob?.failedAt).toBeDefined();
+      expect(failedJob?.failedAt).not.toBeNull();
+      expect(failedJob?.error).toContain("test error");
+    });
+
+    it("should store error information when a scheduled job fails", async () => {
+      const queue = defineQueue({ connection });
+
+      const { id } = await queue.schedule("paint", { cron: "*/1 * * * * *" });
+
+      const worker = defineWorker(
+        "paint",
+        async (job: Job) => {
+          throw new Error("test error");
+        },
+        { queue },
+      );
+
+      void worker.start();
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await worker.stop();
+
+      const failedJob = await queue.getJobById(id);
+      expect(failedJob).toBeDefined();
+      expect(failedJob?.status).toBe(JobStatus.Failed);
+      expect(failedJob?.failedAt).toBeDefined();
+      expect(failedJob?.error).toContain("test error");
+      expect(failedJob?.failedAt).not.toBeNull();
+
+      await queue.close();
+    });
+
+    it("should call onProcessing when a job starts processing", async () => {
+      const queue = defineQueue({ connection });
+      let processingCalled = false;
+
+      const worker = defineWorker("test", async (job: Job) => {}, {
+        queue,
+        onProcessing: (job: Job) => {
+          processingCalled = true;
+        },
+      });
+
+      await queue.add("test", { value: "processing test" });
+      await processAll(queue, worker);
+
+      expect(processingCalled).toBe(true);
+
+      await queue.close();
+    });
+
+    it("should call onCompleted when a job is completed", async () => {
+      const queue = defineQueue({ connection });
+      let completedJob!: Job;
+
+      const worker = defineWorker("test", async (job: Job) => {}, {
+        queue,
+        onCompleted: (job: Job) => {
+          completedJob = job;
+        },
+      });
+
+      await queue.add("test", { value: "completed test" });
+      await processAll(queue, worker);
+
+      expect(JSON.parse(completedJob.data)).toEqual({
+        value: "completed test",
+      });
+
+      await queue.close();
+    });
+
+    it("should call onFailed when a job fails", async () => {
+      const queue = defineQueue({ connection });
+      let failedJob!: Job;
+      let failedError!: string;
+
+      const worker = defineWorker(
+        "test",
+        async (job: Job) => {
+          throw new Error("Test error");
+        },
+        {
+          queue,
+          onFailed: (job: Job, error: string) => {
+            failedJob = job;
+            failedError = error;
+          },
+        },
+      );
+
+      await queue.add("test", { value: "failed test" });
+      await processAll(queue, worker);
+
+      expect(JSON.parse(failedJob.data)).toEqual({ value: "failed test" });
+      expect(failedError).toContain("Test error");
+
+      await queue.close();
+    });
+
+    it("should delay job execution", async () => {
+      const queue = defineQueue({ connection });
+
+      const results: unknown[] = [];
+
+      const worker = defineWorker(
+        "delayed",
+        (job: Job) => {
+          results.push(JSON.parse(job.data));
+        },
+        { queue },
+      );
+
+      const delay = 20;
+      const startTime = Date.now();
+
+      await queue.add("delayed", { value: "instant job" });
+      await queue.add("delayed", { value: "delayed job" }, { delay });
+
+      const adEnd = Date.now();
+
+      // we have to await here for vitest
+      await expect(
+        processAll(queue, worker, { timeout: 200 + (adEnd - startTime) }),
+      ).rejects.toThrow("timeout while waiting for all jobs the be processed");
+
+      expect(results.length).toBe(1);
+      expect(results[0]).toEqual({ value: "instant job" });
+
+      await new Promise((resolve) => setTimeout(resolve, delay + 100));
+
+      await processAll(queue, worker);
+
+      const endTime = Date.now();
+
+      expect(results).toEqual([
+        { value: "instant job" },
+        {
+          value: "delayed job",
+        },
+      ]);
+
+      expect(endTime - startTime).toBeGreaterThanOrEqual(delay);
+    });
+  });
 }

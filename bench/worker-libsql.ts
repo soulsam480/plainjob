@@ -24,7 +24,8 @@ async function run() {
   });
 
   await processAll(queue, worker, { logger, timeout: 60 * 1000 });
-  queue.close();
+
+  await queue.close();
   process.exit(0);
 }
 
