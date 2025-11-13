@@ -1,10 +1,7 @@
-import type {
-  Database as BetterSqlite3Database,
-  Transaction,
-} from "better-sqlite3";
-import type { Database as BunSqliteDatabase } from "bun:sqlite";
+import type { Client } from "@libsql/client";
 import cronParser from "cron-parser";
 import {
+  type Job,
   JobStatus,
   type Logger,
   type PersistedJob,
@@ -12,57 +9,138 @@ import {
   ScheduledJobStatus,
 } from "./jobs";
 
-type VariableArgFunction = (...params: any[]) => unknown;
+// biome-ignore lint/suspicious/noExplicitAny: this is fine
+type VariableArgFunction = <T>(...params: any[]) => Promise<T>;
+
+interface ISQLStatement {
+  sql: string;
+  // biome-ignore lint/suspicious/noExplicitAny: this is fine
+  args: any[];
+  // biome-ignore lint/suspicious/noExplicitAny: this is fine
+  with: (...args: any[]) => ISQLStatement;
+}
 
 interface GenericStatement {
-  run: (...params: any) => {
-    changes: number;
-    lastInsertRowid: number | bigint;
-  };
+  // biome-ignore lint/suspicious/noExplicitAny: this is fine
+  run: (...params: any) => Promise<ITransactionResult>;
   get: VariableArgFunction;
-  all: VariableArgFunction;
+  // biome-ignore lint/suspicious/noExplicitAny: this is fine
+  all: <T>(...params: any[]) => Promise<T[]>;
+  stmt: ISQLStatement;
+}
+
+interface ITransactionResult {
+  changes: number;
+  lastInsertRowid: number | bigint;
+  rows: unknown[];
+}
+
+export function sql(
+  strings: TemplateStringsArray,
+  // biome-ignore lint/suspicious/noExplicitAny: this is fine
+  ...interpolations: any[]
+): ISQLStatement {
+  let query = "";
+
+  // biome-ignore lint/suspicious/noExplicitAny: this is fine
+  const args: any[] = [];
+
+  // Build SQL string, replacing interpolations with '?'
+  strings.forEach((part, i) => {
+    query += part;
+    if (i < interpolations.length) {
+      query += "?";
+      args.push(interpolations[i]);
+    }
+  });
+
+  // Check if there are additional args after the template literal
+  // e.g. sql`SELECT * FROM users WHERE id = ${id} AND active = ?`, true
+  const extraArgs = Array.prototype.slice.call(
+    // biome-ignore lint/complexity/noArguments: this is fine
+    arguments,
+    1 + interpolations.length,
+  );
+
+  if (extraArgs.length) {
+    args.push(...extraArgs);
+  }
+
+  // Optional cleanup: remove redundant whitespace
+  const sql = query.trim().replace(/\s+/g, " ");
+
+  // biome-ignore lint/suspicious/noExplicitAny: this is fine
+  const mapper = (...child_args: any[]) => ({
+    sql,
+    args: [...args, ...child_args],
+    with: mapper,
+  });
+
+  return {
+    sql,
+    args,
+    with: mapper,
+  };
 }
 
 export interface Connection {
   driver: string;
-  filename: string;
-  pragma: (stmt: string) => void;
-  exec: (stmt: string) => void;
-  prepare: (stmt: string) => GenericStatement;
-  transaction<F extends VariableArgFunction>(fn: F): Transaction<F>;
+  pragma: (stmt: string | ISQLStatement) => Promise<void>;
+  exec: (stmt: string | ISQLStatement) => Promise<void>;
+  prepare: (stmt: ISQLStatement) => GenericStatement;
+  transaction(stmts: Array<ISQLStatement>): Promise<ITransactionResult[]>;
   close: () => void;
 }
 
-export function better(database: BetterSqlite3Database): Connection {
+export function libsql(database: Client): Connection {
   return {
-    driver: "better-sqlite3",
-    filename: database.name,
-    pragma: database.pragma.bind(database),
-    transaction: database.transaction.bind(database) as <
-      F extends VariableArgFunction
-    >(
-      fn: F
-    ) => Transaction<F>,
-    exec: database.exec.bind(database),
-    prepare: database.prepare.bind(database),
-    close: database.close.bind(database),
-  };
-}
-
-export function bun(database: BunSqliteDatabase): Connection {
-  return {
-    driver: "bun:sqlite",
-    filename: database.filename,
-    pragma: (stmt: string) => {
-      database.exec(`PRAGMA ${stmt};`);
+    driver: "libsql",
+    pragma: async (...args) => {
+      try {
+        await database.execute(...args);
+      } catch {}
     },
-    transaction: database.transaction.bind(database) as <
-      F extends VariableArgFunction
-    >(
-      fn: F
-    ) => Transaction<F>,
-    exec: database.exec.bind(database),
-    prepare: database.query.bind(database),
+    async transaction(stmts) {
+      const res = await database.batch(stmts);
+
+      return res.map((it) => ({
+        changes: it.rowsAffected,
+        lastInsertRowid: it.lastInsertRowid as unknown as number,
+        rows: it.rows,
+      }));
+    },
+    async exec(stmt) {
+      await database.execute(stmt);
+    },
+    prepare(stmt) {
+      return {
+        // biome-ignore lint/suspicious/noExplicitAny: this is fine
+        async get<T>(...args: any[]) {
+          const res = await database.execute(stmt.with(...args));
+
+          return res.rows[0] as unknown as T;
+        },
+
+        // biome-ignore lint/suspicious/noExplicitAny: this is fine
+        async all<T>(...args: any[]) {
+          const res = await database.execute(stmt.with(...args));
+
+          return res.rows as unknown as T[];
+        },
+
+        // biome-ignore lint/suspicious/noExplicitAny: this is fine
+        async run(...args: any[]) {
+          const res = await database.execute(stmt.with(...args));
+
+          return {
+            changes: res.rowsAffected,
+            lastInsertRowid: res.lastInsertRowid as unknown as number,
+            rows: res.rows,
+          };
+        },
+        stmt,
+      } satisfies GenericStatement;
+    },
     close: database.close.bind(database),
   };
 }
@@ -88,6 +166,8 @@ export type QueueOptions = {
   onProcessingJobsRequeued?: (n: number) => void;
   /** A function that serializes job data before storing it in the database. */
   serializer?: (data: unknown) => string;
+  /** Disable maintenance tasks (useful for worker processes). */
+  disableMaintenance?: boolean;
 };
 
 /** A queue of jobs. */
@@ -96,64 +176,63 @@ export type Queue = {
   add: (
     type: string,
     data: unknown,
-    options?: { delay?: number }
-  ) => { id: number };
+    options?: { delay?: number },
+  ) => Promise<{ id: number }>;
+
   /** Adds multiple new jobs of the same type to the queue. */
   addMany: (
     type: string,
     data: unknown[],
-    options?: { delay?: number }
-  ) => { ids: number[] };
+    options?: { delay?: number },
+  ) => Promise<{ ids: number[] }>;
   /** Schedules a recurring job using a cron expression. */
-  schedule: (type: string, { cron }: { cron: string }) => { id: number };
+  schedule: (
+    type: string,
+    { cron }: { cron: string },
+  ) => Promise<{ id: number }>;
   /** Counts jobs in the queue, optionally filtered by type and/or status. */
-  countJobs: (opts?: { type?: string; status?: JobStatus }) => number;
+  countJobs: (opts?: { type?: string; status?: JobStatus }) => Promise<number>;
   /** Retrieves a job by its ID. */
-  getJobById: (id: number) => PersistedJob | undefined;
+  getJobById: (id: number) => Promise<PersistedJob | undefined>;
   /** Gets a list of all unique job types in the queue. */
-  getJobTypes: () => string[];
+  getJobTypes: () => Promise<string[]>;
   /** Retrieves all scheduled jobs. */
-  getScheduledJobs: () => PersistedScheduledJob[];
+  getScheduledJobs: () => Promise<PersistedScheduledJob[]>;
   /** Retrieves a scheduled job by its ID. */
-  getScheduledJobById: (id: number) => PersistedScheduledJob | undefined;
+  getScheduledJobById: (
+    id: number,
+  ) => Promise<PersistedScheduledJob | undefined>;
   /** Requeues jobs that have exceeded the specified timeout. */
-  requeueTimedOutJobs: (timeout: number) => void;
+  requeueTimedOutJobs: (timeout: number) => Promise<void>;
   /** Removes completed jobs older than the specified duration. */
-  removeDoneJobs: (olderThan: number) => void;
+  removeDoneJobs: (olderThan: number) => Promise<void>;
   /** Removes failed jobs older than the specified duration. */
-  removeFailedJobs: (olderThan: number) => void;
+  removeFailedJobs: (olderThan: number) => Promise<void>;
   /** Fetches the next pending job of the specified type and marks it as processing. */
-  getAndMarkJobAsProcessing: (type: string) => { id: number } | undefined;
+  getAndMarkJobAsProcessing: (
+    type: string,
+  ) => Promise<{ id: number } | undefined>;
+
   /** Fetches the next scheduled job due for execution and marks it as processing. */
-  getAndMarkScheduledJobAsProcessing: () => PersistedScheduledJob | undefined;
+  getAndMarkScheduledJobAsProcessing: () => Promise<
+    PersistedScheduledJob | undefined
+  >;
   /** Marks a job as completed. */
-  markJobAsDone: (id: number) => void;
+  markJobAsDone: (id: number) => Promise<void>;
   /** Marks a job as failed with an error message. */
-  markJobAsFailed: (id: number, error: string) => void;
+  markJobAsFailed: (id: number, error: string) => Promise<void>;
   /** Marks a scheduled job as idle and sets its next execution time. */
-  markScheduledJobAsIdle: (id: number, nextRunAt: number) => void;
+  markScheduledJobAsIdle: (id: number, nextRunAt: number) => Promise<void>;
   /** Closes the queue, stopping maintenance tasks and releasing resources. */
-  close: () => void;
+  close: () => Promise<void>;
 };
 
-export function defineQueue(opts: QueueOptions): Queue {
-  const db = opts.connection;
-  const log = opts.logger || console;
-  const jobProcessingTimeout = opts.timeout || 30 * 60 * 1000; // 30 minutes
-  const maintenanceInterval = opts.maintenanceInterval || 60 * 1000; // 1 minute
-  const removeDoneJobsOlderThan =
-    opts.removeDoneJobsOlderThan || 7 * 24 * 60 * 60 * 1000; // 7 days
-  const removeFailedJobsOlderThan =
-    opts.removeFailedJobsOlderThan || 30 * 24 * 60 * 60 * 1000; // 30 days
-  let maintenanceTimeout: Timer;
-  const serializer = opts.serializer || ((data) => JSON.stringify(data));
+export async function setupQueueDeps(db: Connection) {
+  await db.pragma("journal_mode = WAL");
+  await db.pragma("busy_timeout = 30000");
 
-  db.pragma("journal_mode = WAL");
-  db.pragma("synchronous = 1");
-  db.pragma("busy_timeout = 5000");
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS plainjob_jobs (
+  await db.transaction([
+    sql`CREATE TABLE IF NOT EXISTS plainjob_jobs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       type TEXT NOT NULL,
       data TEXT NOT NULL,
@@ -162,57 +241,65 @@ export function defineQueue(opts: QueueOptions): Queue {
       error TEXT,
       next_run_at INTEGER,
       created_at INTEGER NOT NULL
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_jobs_status_type_next_run_at ON plainjob_jobs (status, type, next_run_at);
-
-    CREATE TABLE IF NOT EXISTS plainjob_scheduled_jobs (
+    )`,
+    sql`CREATE INDEX IF NOT EXISTS idx_jobs_status_type_next_run_at ON plainjob_jobs (status, type, next_run_at)`,
+    sql`CREATE TABLE IF NOT EXISTS plainjob_scheduled_jobs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       type TEXT NOT NULL UNIQUE,
       status INTEGER DEFAULT 0 NOT NULL,
       cron_expression TEXT,
       next_run_at INTEGER,
       created_at INTEGER NOT NULL
-    );
+    )`,
+    sql`CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_status_type_next_run_at ON plainjob_scheduled_jobs (status, type, next_run_at)`,
+  ]);
+}
 
-    CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_status_type_next_run_at ON plainjob_scheduled_jobs (status, type, next_run_at);
+export function defineQueue(opts: QueueOptions): Queue {
+  const db = opts.connection;
+  const log = opts.logger || console;
+  const jobProcessingTimeout = opts.timeout || 30 * 60 * 1000; // 30 minutes
+  const maintenanceInterval = opts.maintenanceInterval || 60 * 1000; // 1 minute
+
+  const removeDoneJobsOlderThan =
+    opts.removeDoneJobsOlderThan || 7 * 24 * 60 * 60 * 1000; // 7 days
+
+  const removeFailedJobsOlderThan =
+    opts.removeFailedJobsOlderThan || 30 * 24 * 60 * 60 * 1000; // 30 days
+
+  let maintenanceTimeout: Timer;
+
+  const serializer = opts.serializer || ((data) => JSON.stringify(data));
+
+  const removeDoneJobsStmt = db.prepare(sql`
+    DELETE FROM plainjob_jobs
+    WHERE status = ${JobStatus.Done} AND created_at < ?
   `);
 
-  const removeDoneJobsStmt = db.prepare(`
-    DELETE FROM plainjob_jobs 
-    WHERE status = ${JobStatus.Done} AND next_run_at < @threshold
+  const removeFailedJobsStmt = db.prepare(sql`
+    DELETE FROM plainjob_jobs
+    WHERE status = ${JobStatus.Failed} AND failed_at < ?
   `);
 
-  const removeFailedJobsStmt = db.prepare(`
-    DELETE FROM plainjob_jobs 
-    WHERE status = ${JobStatus.Failed} AND failed_at < @threshold
-  `);
-
-  function initializeMaintenance() {
-    maintenanceTimeout = setInterval(() => {
-      queue.requeueTimedOutJobs(jobProcessingTimeout);
-      queue.removeDoneJobs(removeDoneJobsOlderThan);
-      queue.removeFailedJobs(removeFailedJobsOlderThan);
-    }, maintenanceInterval);
-  }
-
-  const countJobsStmt = db.prepare("SELECT COUNT(*) FROM plainjob_jobs");
+  const countJobsStmt = db.prepare(sql`SELECT COUNT(*) FROM plainjob_jobs`);
 
   const countJobsByTypeAndStatusStmt = db.prepare(
-    "SELECT COUNT(*) FROM plainjob_jobs WHERE status = @status AND type = @type"
+    sql`SELECT COUNT(*) FROM plainjob_jobs WHERE status = ? AND type = ?`,
   );
 
   const countJobsByStatusStmt = db.prepare(
-    "SELECT COUNT(*) FROM plainjob_jobs WHERE status = @status"
+    sql`SELECT COUNT(*) FROM plainjob_jobs WHERE status = ?`,
   );
 
   const countJobsByTypeStmt = db.prepare(
-    "SELECT COUNT(*) FROM plainjob_jobs WHERE type = @type"
+    sql`SELECT COUNT(*) FROM plainjob_jobs WHERE type = ?`,
   );
 
-  const getJobTypesStmt = db.prepare("SELECT DISTINCT type FROM plainjob_jobs");
+  const getJobTypesStmt = db.prepare(
+    sql`SELECT DISTINCT type FROM plainjob_jobs`,
+  );
 
-  const getJobByIdStmt = db.prepare(`
+  const getJobByIdStmt = db.prepare(sql`
     SELECT 
       id,
       type,
@@ -226,7 +313,7 @@ export function defineQueue(opts: QueueOptions): Queue {
     WHERE id = ?
   `);
 
-  const getScheduledJobByIdStmt = db.prepare(`
+  const getScheduledJobByIdStmt = db.prepare(sql`
     SELECT 
       id,
       type,
@@ -238,19 +325,11 @@ export function defineQueue(opts: QueueOptions): Queue {
     WHERE id = ?
   `);
 
-  const getScheduledJobByTypeStmt = db.prepare(`
-    SELECT 
-      id,
-      type,
-      status,
-      created_at as createdAt,
-      cron_expression as cronExpression,
-      next_run_at as nextRunAt
-    FROM plainjob_scheduled_jobs 
-    WHERE type = @type
+  const getScheduledJobByTypeStmt = db.prepare(sql`
+    SELECT * FROM plainjob_scheduled_jobs WHERE type = ?
   `);
 
-  const getScheduledJobsStmt = db.prepare(`
+  const getScheduledJobsStmt = db.prepare(sql`
     SELECT 
       id,
       type,
@@ -263,248 +342,273 @@ export function defineQueue(opts: QueueOptions): Queue {
   `);
 
   const insertJobStmt = db.prepare(
-    "INSERT INTO plainjob_jobs (type, data, created_at, next_run_at) VALUES (@type, @data, @createdAt, @nextRunAt)"
+    sql`INSERT INTO plainjob_jobs (type, data, created_at, next_run_at) VALUES (?, ?, ?, ?) RETURNING id`,
   );
 
   const insertScheduledJobStmt = db.prepare(
-    "INSERT INTO plainjob_scheduled_jobs (type, cron_expression, next_run_at, created_at) VALUES (@type, @cronExpression, @nextRunAt, @createdAt)"
+    sql`INSERT INTO plainjob_scheduled_jobs (type, cron_expression, next_run_at, created_at) VALUES (?, ?, ?, ?) RETURNING id`,
   );
 
-  const updateScheduledJobCronExpressionStmt = db.prepare(`
-    UPDATE plainjob_scheduled_jobs SET cron_expression = @cronExpression WHERE id = @id
+  const updateScheduledJobCronExpressionStmt = db.prepare(sql`
+    UPDATE plainjob_scheduled_jobs SET cron_expression = ? WHERE id = ?
   `);
 
-  const requeueTimedOutJobsStmt = db.prepare(`
-    UPDATE plainjob_jobs SET status = ${JobStatus.Pending} WHERE status = ${JobStatus.Processing} AND next_run_at < @threshold
+  const requeueTimedOutJobsStmt = db.prepare(sql`
+    UPDATE plainjob_jobs SET status = ${JobStatus.Pending} WHERE status = ${JobStatus.Processing} AND next_run_at < ?
   `);
 
-  const getJobIdToProcessNextStmt = db.prepare(`
-  SELECT id
-  FROM plainjob_jobs 
-  WHERE status = ${JobStatus.Pending} AND type = @type AND next_run_at <= @now
-  ORDER BY next_run_at LIMIT 1
-`);
-
-  const updateJobAsProcessingStmt = db.prepare(`
-  UPDATE plainjob_jobs SET status = ${JobStatus.Processing}
-  WHERE id = @id
-`);
-
-  const getNextScheduledJobStmt = db.prepare(`
-    SELECT 
-      id,
-      type,
-      status,
-      created_at as createdAt,
-      cron_expression as cronExpression,
-      next_run_at as nextRunAt
-    FROM plainjob_scheduled_jobs 
-    WHERE status = ${ScheduledJobStatus.Idle} AND next_run_at <= @now
-    ORDER BY next_run_at LIMIT 1
+  const claimJobStmt = db.prepare(sql`
+    UPDATE plainjob_jobs 
+    SET status = ?, next_run_at = ?
+    WHERE id = (
+      SELECT id FROM plainjob_jobs 
+      WHERE status = ? AND type = ? AND next_run_at <= ?
+      ORDER BY next_run_at
+      LIMIT 1
+    )
+    RETURNING id
   `);
 
-  const updateJobStatusStmt = db.prepare(`
-    UPDATE plainjob_jobs SET status = @status WHERE id = @id
+  const getClaimedJobStmt = db.prepare(sql`
+    SELECT id, status, type FROM plainjob_jobs
+    WHERE id = ?
   `);
 
-  const updateScheduledJobStatusStmt = db.prepare(`
-    UPDATE plainjob_scheduled_jobs SET status = @status, next_run_at = @nextRunAt WHERE id = @id
+  const claimScheduledJobStmt = db.prepare(sql`
+    UPDATE plainjob_scheduled_jobs 
+    SET status = ?
+    WHERE id = (
+      SELECT id FROM plainjob_scheduled_jobs 
+      WHERE status = ? AND next_run_at <= ?
+      ORDER BY next_run_at
+      LIMIT 1
+    )
+    RETURNING id
   `);
 
-  const failJobStmt = db.prepare(`
-    UPDATE plainjob_jobs SET status = ${JobStatus.Failed}, failed_at = @failedAt, error = @error WHERE id = @id
+  const getClaimedScheduledJobStmt = db.prepare(sql`
+    SELECT
+       id,
+       type,
+       status,
+       created_at as createdAt,
+       cron_expression as cronExpression,
+       next_run_at as nextRunAt
+     FROM plainjob_scheduled_jobs
+     WHERE rowid = ?
+  `);
+
+  const updateJobStatusStmt = db.prepare(sql`
+    UPDATE plainjob_jobs SET status = ? WHERE id = ?
+  `);
+
+  const updateJobNextRunAtStmt = db.prepare(sql`
+    UPDATE plainjob_jobs SET next_run_at = ? WHERE id = ?
+  `);
+
+  const updateScheduledJobStatusStmt = db.prepare(sql`
+    UPDATE plainjob_scheduled_jobs SET status = ?, next_run_at = ? WHERE id = ?
+  `);
+
+  const failJobStmt = db.prepare(sql`
+    UPDATE plainjob_jobs SET status = ${JobStatus.Failed}, failed_at = ?, error = ? WHERE id = ?
   `);
 
   const queue: Queue = {
-    add(
+    async add(
       type: string,
       data: unknown,
-      options: { delay?: number } = {}
-    ): { id: number } {
+      options: { delay?: number } = {},
+    ): Promise<{ id: number }> {
       const now = Date.now();
+
       const serializedData = serializer(data);
-      const result = insertJobStmt.run({
+
+      const result = await insertJobStmt.run(
         type,
-        data: serializedData,
-        createdAt: now,
-        nextRunAt: now + (options.delay ?? 0),
-      });
-      return { id: result.lastInsertRowid as number };
+        serializedData,
+        now,
+        now + (options.delay ?? 0),
+      );
+
+      return { id: (result.rows[0] as PersistedJob)?.id as number };
     },
-    addMany(
+    async addMany(
       type: string,
       dataList: unknown[],
-      options: { delay?: number } = {}
-    ): { ids: number[] } {
+      options: { delay?: number } = {},
+    ): Promise<{ ids: number[] }> {
       const now = Date.now();
-      const ids: number[] = [];
-      const insertManyJobs = db.transaction(
-        (jobs: { type: string; data: string; createdAt: number }[]) => {
-          for (const job of jobs) {
-            const result = insertJobStmt.run(job);
-            ids.push(result.lastInsertRowid as number);
-          }
-        }
-      );
-      const jobs = dataList.map((data) => ({
-        type,
-        data: serializer(data),
-        createdAt: now,
-        nextRunAt: now + (options.delay ?? 0),
-      }));
 
-      insertManyJobs(jobs);
-      return { ids };
+      const res = await db.transaction(
+        dataList.map((data) => {
+          return insertJobStmt.stmt.with(
+            type,
+            serializer(data),
+            now,
+            now + (options.delay ?? 0),
+          );
+        }),
+      );
+
+      return { ids: res.map((it) => (it.rows[0] as PersistedJob)?.id) };
     },
-    schedule(type: string, { cron }: { cron: string }): { id: number } {
+    async schedule(
+      type: string,
+      { cron }: { cron: string },
+    ): Promise<{ id: number }> {
       try {
         cronParser.parseExpression(cron);
       } catch (error) {
         throw new Error(
           `invalid cron expression provided: ${cron} ${
             (error as Error).message
-          }`
+          }`,
         );
       }
-      const found = (getScheduledJobByTypeStmt.get({
-        type,
-      }) ?? undefined) as PersistedScheduledJob | undefined;
+
+      const now = Date.now();
+
+      const found = await getScheduledJobByTypeStmt.get<
+        PersistedScheduledJob | undefined
+      >(type);
+
       if (found) {
         log.debug(
-          `updating existing scheduled job ${found.id} with cron expression ${cron}`
+          `updating existing scheduled job ${found.id} with cron expression ${cron}`,
         );
-        updateScheduledJobCronExpressionStmt.run({
-          cronExpression: cron,
-          id: found.id,
-        });
+
+        await updateScheduledJobCronExpressionStmt.run(cron, found.id);
+
         return { id: found.id };
       }
-      const result = insertScheduledJobStmt.run({
-        type,
-        cronExpression: cron,
-        nextRunAt: 0,
-        createdAt: Date.now(),
-      });
-      return { id: result.lastInsertRowid as number };
+
+      const result = await insertScheduledJobStmt.run(type, cron, 0, now);
+      return { id: (result.rows[0] as PersistedJob)?.id };
     },
-    countJobs(opts?: { type?: string; status?: JobStatus }) {
+    async countJobs(opts?: {
+      type?: string;
+      status?: JobStatus;
+    }): Promise<number> {
+      let result: Record<"COUNT(*)", number>;
+
       if (opts?.type && opts?.status !== undefined) {
-        const result = (countJobsByTypeAndStatusStmt.get({
-          type: opts.type,
-          status: opts.status,
-        }) ?? undefined) as { "COUNT(*)": number };
-        return result["COUNT(*)"];
-      }
-      if (opts?.status !== undefined && !opts?.type) {
-        const result = (countJobsByStatusStmt.get({ status: opts.status }) ??
-          undefined) as {
-          "COUNT(*)": number;
-        };
-        return result["COUNT(*)"];
-      }
-      if (opts?.type && opts?.status === undefined) {
-        const result = (countJobsByTypeStmt.get({ type: opts.type }) ??
-          undefined) as {
-          "COUNT(*)": number;
-        };
-        return result["COUNT(*)"];
+        result = await countJobsByTypeAndStatusStmt.get(opts.status, opts.type);
+      } else if (opts?.status !== undefined && !opts?.type) {
+        result = await countJobsByStatusStmt.get(opts.status);
+      } else if (opts?.type && opts?.status === undefined) {
+        result = await countJobsByTypeStmt.get(opts.type);
+      } else {
+        result = await countJobsStmt.get();
       }
 
-      const result = (countJobsStmt.get() ?? undefined) as {
-        "COUNT(*)": number;
-      };
       return result["COUNT(*)"];
     },
-    getJobById(id: number): PersistedJob | undefined {
-      return (getJobByIdStmt.get(id) ?? undefined) as PersistedJob | undefined;
+    async getJobById(id: number): Promise<PersistedJob | undefined> {
+      return await getJobByIdStmt.get<PersistedJob | undefined>(id);
     },
-    getJobTypes() {
-      const result = getJobTypesStmt.all() as { type: string }[];
+    async getJobTypes(): Promise<string[]> {
+      const result = await getJobTypesStmt.all<{ type: string }>();
       return result.map((row) => row.type);
     },
-    getScheduledJobs() {
-      const result = getScheduledJobsStmt.all() as PersistedScheduledJob[];
-      return result;
+    async getScheduledJobs(): Promise<PersistedScheduledJob[]> {
+      return await getScheduledJobsStmt.all<PersistedScheduledJob>();
     },
-    getScheduledJobById(id: number): PersistedScheduledJob | undefined {
-      return getScheduledJobByIdStmt.get(id) as
-        | PersistedScheduledJob
-        | undefined;
+    async getScheduledJobById(
+      id: number,
+    ): Promise<PersistedScheduledJob | undefined> {
+      return await getScheduledJobByIdStmt.get<
+        PersistedScheduledJob | undefined
+      >(id);
     },
-    requeueTimedOutJobs(timeout: number) {
+    async requeueTimedOutJobs(timeout: number): Promise<void> {
       const now = Date.now();
-      const result = requeueTimedOutJobsStmt.run({ threshold: now - timeout });
-      log.debug(`requeued ${result.changes} timed out jobs`);
-      if (opts.onProcessingJobsRequeued) {
-        opts.onProcessingJobsRequeued(result.changes);
-      }
-    },
-    removeDoneJobs(olderThan: number) {
-      const now = Date.now();
-      const result = removeDoneJobsStmt.run({ threshold: now - olderThan });
-      log.debug(`removed ${result.changes} done jobs`);
-      if (opts.onDoneJobsRemoved) {
-        opts.onDoneJobsRemoved(result.changes);
-      }
-    },
-    removeFailedJobs(olderThan: number) {
-      const now = Date.now();
-      const result = removeFailedJobsStmt.run({ threshold: now - olderThan });
-      log.debug(`removed ${result.changes} failed jobs`);
-      if (opts.onFailedJobsRemoved) {
-        opts.onFailedJobsRemoved(result.changes);
-      }
-    },
-    getAndMarkJobAsProcessing(type: string): { id: number } | undefined {
-      const now = Date.now();
-      return db
-        .transaction(() => {
-          const id = getJobIdToProcessNextStmt.get({ type, now }) as
-            | { id: number }
-            | undefined;
-          if (!id || !id.id) return undefined;
-          updateJobAsProcessingStmt.run({ id: id.id });
-          return id;
-        })
-        .immediate();
-    },
-    getAndMarkScheduledJobAsProcessing(): PersistedScheduledJob | undefined {
-      return db
-        .transaction((): PersistedScheduledJob | undefined => {
-          const job = (getNextScheduledJobStmt.get({
-            now: Date.now(),
-          }) ?? undefined) as PersistedScheduledJob | undefined;
+      const result = await requeueTimedOutJobsStmt.run(now - timeout);
 
-          if (job) {
-            updateScheduledJobStatusStmt.run({
-              status: ScheduledJobStatus.Processing,
-              id: job.id,
-              nextRunAt: job.nextRunAt,
-            });
-            return { ...job, status: ScheduledJobStatus.Processing };
-          }
-          return undefined;
-        })
-        .immediate();
+      log.debug(`requeued ${result.changes} timed out jobs`);
+
+      opts.onProcessingJobsRequeued?.(result.changes);
     },
-    markJobAsDone(id: number) {
-      return updateJobStatusStmt.run({ status: JobStatus.Done, id });
+    async removeDoneJobs(olderThan: number): Promise<void> {
+      const now = Date.now();
+      const result = await removeDoneJobsStmt.run(now - olderThan);
+
+      log.debug(`removed ${result.changes} done jobs`);
+
+      opts.onDoneJobsRemoved?.(result.changes);
     },
-    markJobAsFailed(id: number, error: string) {
-      return failJobStmt.run({
-        failedAt: Date.now(),
-        error,
-        id,
-      });
+    async removeFailedJobs(olderThan: number): Promise<void> {
+      const now = Date.now();
+      const result = await removeFailedJobsStmt.run(now - olderThan);
+
+      log.debug(`removed ${result.changes} failed jobs`);
+
+      opts.onFailedJobsRemoved?.(result.changes);
     },
-    markScheduledJobAsIdle(id: number, nextRunAt: number) {
-      return updateScheduledJobStatusStmt.run({
-        status: ScheduledJobStatus.Idle,
-        id,
+    async getAndMarkJobAsProcessing(
+      type: string,
+    ): Promise<{ id: number } | undefined> {
+      const now = Date.now();
+      const timeout = now + jobProcessingTimeout;
+
+      const result = await claimJobStmt.run(
+        JobStatus.Processing,
+        timeout,
+        JobStatus.Pending,
+        type,
+        now,
+      );
+
+      const updatedRowId = (result.rows[0] as Job)?.id;
+
+      if (updatedRowId === undefined) {
+        return;
+      }
+
+      const job = await getClaimedJobStmt.get<{ id: number }>(updatedRowId);
+
+      return job;
+    },
+    async getAndMarkScheduledJobAsProcessing(): Promise<
+      PersistedScheduledJob | undefined
+    > {
+      const now = Date.now();
+
+      const result = await claimScheduledJobStmt.run(
+        ScheduledJobStatus.Processing,
+        ScheduledJobStatus.Idle,
+        now,
+      );
+
+      const updatedRowId = (result.rows[0] as Job)?.id;
+
+      if (updatedRowId === undefined) {
+        return;
+      }
+
+      const job =
+        await getClaimedScheduledJobStmt.get<PersistedScheduledJob>(
+          updatedRowId,
+        );
+
+      return job;
+    },
+    async markJobAsDone(id: number): Promise<void> {
+      await updateJobStatusStmt.run(JobStatus.Done, id);
+      // Update next_run_at to current time when marking as done for proper age tracking
+      await updateJobNextRunAtStmt.run(Date.now(), id);
+    },
+    async markJobAsFailed(id: number, error: string): Promise<void> {
+      await failJobStmt.run(Date.now(), error, id);
+    },
+    async markScheduledJobAsIdle(id: number, nextRunAt: number): Promise<void> {
+      await updateScheduledJobStatusStmt.run(
+        ScheduledJobStatus.Idle,
         nextRunAt,
-      });
+        id,
+      );
     },
-    close() {
+    async close(): Promise<void> {
       if (maintenanceTimeout) {
         clearInterval(maintenanceTimeout);
       }
@@ -512,7 +616,18 @@ export function defineQueue(opts: QueueOptions): Queue {
     },
   };
 
-  initializeMaintenance();
+  function initializeMaintenance() {
+    maintenanceTimeout = setInterval(async () => {
+      await queue.requeueTimedOutJobs(jobProcessingTimeout);
+      await queue.removeDoneJobs(removeDoneJobsOlderThan);
+      await queue.removeFailedJobs(removeFailedJobsOlderThan);
+    }, maintenanceInterval);
+  }
+
+  // Only start maintenance if not disabled (for worker processes)
+  if (!opts.disableMaintenance) {
+    initializeMaintenance();
+  }
 
   return queue;
 }

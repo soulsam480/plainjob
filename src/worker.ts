@@ -1,5 +1,5 @@
 import cronParser from "cron-parser";
-import { JobStatus, type Job, type Logger, type PersistedJob } from "./jobs";
+import { type Job, JobStatus, type Logger } from "./jobs";
 import type { Queue } from "./queue";
 
 /** Function that processes a job and optionally returns a promise. */
@@ -31,80 +31,101 @@ type WorkerOptions = {
 export function defineWorker(
   jobType: string,
   processor: JobProcessor,
-  options: WorkerOptions
+  options: WorkerOptions,
 ): Worker {
   const log = options.logger || console;
+
   const id = Math.random().toString(36).substring(2, 15);
   const pollInterval = options.pollIntervall ?? 1000;
   const queue = options.queue;
+
   let shouldKeepRunning = false;
   let isRunning = true;
+
   let cancelSleep: (() => void) | undefined;
   let sleeping: Promise<void> | undefined;
 
   async function processScheduledJobs() {
     log.debug(`worker [${id}] checking for scheduled jobs`);
-    const scheduledJob = queue.getAndMarkScheduledJobAsProcessing();
-    if (scheduledJob) {
-      log.debug(
-        `worker [${id}] processing scheduled job '${scheduledJob.id}' '${scheduledJob.type}'`
-      );
-      const nextRunAt = cronParser
-        .parseExpression(scheduledJob.cronExpression)
-        .next()
-        .toDate()
-        .getTime();
-      queue.markScheduledJobAsIdle(scheduledJob.id, nextRunAt);
-      log.debug(
-        `worker [${id}] marking scheduled job ${scheduledJob.id} as 'idle'`
-      );
-      queue.add(scheduledJob.type, {});
-      log.debug(
-        `worker [${id}] adding job '${scheduledJob.id}' '${scheduledJob.type}' from scheduled job`
-      );
 
-      return true;
+    const scheduledJob = await queue.getAndMarkScheduledJobAsProcessing();
+
+    if (!scheduledJob) {
+      return false;
     }
-    return false;
+
+    log.debug(
+      `worker [${id}] processing scheduled job '${scheduledJob.id}' '${scheduledJob.type}'`,
+    );
+
+    const nextRunAt = cronParser
+      .parseExpression(scheduledJob.cronExpression)
+      .next()
+      .toDate()
+      .getTime();
+
+    await queue.markScheduledJobAsIdle(scheduledJob.id, nextRunAt);
+
+    log.debug(
+      `worker [${id}] marking scheduled job ${scheduledJob.id} as 'idle'`,
+    );
+
+    await queue.add(scheduledJob.type, {});
+
+    log.debug(
+      `worker [${id}] adding job '${scheduledJob.id}' '${scheduledJob.type}' from scheduled job`,
+    );
+
+    return true;
   }
 
   async function processRegularJobs() {
     log.debug(`worker [${id}] checking for regular jobs`);
-    const jobId = queue.getAndMarkJobAsProcessing(jobType);
-    if (jobId) {
-      const job = queue.getJobById(jobId.id) as PersistedJob;
-      if (options.onProcessing) {
-        const job = queue.getJobById(jobId.id);
-        options.onProcessing(job!);
-      }
-      log.debug(
-        `worker [${id}] processing job ${job.id}, ${job.type}, ${job.data}`
-      );
-      try {
-        await processor({ id: job.id, data: job.data, type: job.type });
-        queue.markJobAsDone(job.id);
-        if (options.onCompleted) {
-          options.onCompleted(job);
-        }
-        log.debug(`worker [${id}] marking job ${job.id} as 'done'`);
-      } catch (error) {
-        const errorMessage = `${(error as Error).stack}\n${
-          (error as Error).message
-        }`;
-        queue.markJobAsFailed(job.id, errorMessage);
-        if (options.onFailed) {
-          options.onFailed(job, errorMessage);
-        }
-        log.error(`worker [${id}] marking job ${job.id} as 'failed'`);
-      }
-      return true;
+
+    const jobId = await queue.getAndMarkJobAsProcessing(jobType);
+
+    if (!jobId) {
+      return false;
     }
-    return false;
+
+    const job = await queue.getJobById(jobId.id);
+
+    if (!job) {
+      return false;
+    }
+
+    options.onProcessing?.(job);
+
+    log.debug(
+      `worker [${id}] processing job ${job.id}, ${job.type}, ${job.data}`,
+    );
+
+    try {
+      await processor({ id: job.id, data: job.data, type: job.type });
+      await queue.markJobAsDone(job.id);
+
+      options.onCompleted?.(job);
+
+      log.debug(`worker [${id}] marking job ${job.id} as 'done'`);
+    } catch (error) {
+      const errorMessage = `${(error as Error).stack}\n${
+        (error as Error).message
+      }`;
+
+      await queue.markJobAsFailed(job.id, errorMessage);
+
+      options.onFailed?.(job, errorMessage);
+
+      log.error(`worker [${id}] marking job ${job.id} as 'failed'`);
+    }
+
+    return true;
   }
 
   async function start() {
     try {
       shouldKeepRunning = true;
+
       while (shouldKeepRunning) {
         const processedScheduled = await processScheduledJobs();
         const processedRegular = await processRegularJobs();
@@ -123,10 +144,12 @@ export function defineWorker(
               resolve();
             };
           });
+
           await sleeping;
           cancelSleep = undefined;
         }
       }
+
       isRunning = false;
     } catch (error) {
       log.error(`worker [${id}] encountered error: ${error}`);
@@ -136,12 +159,15 @@ export function defineWorker(
 
   async function stop() {
     log.info(`worker [${id}] shutting down...`);
+
     shouldKeepRunning = false;
-    if (cancelSleep) {
-      cancelSleep();
-    }
+
+    cancelSleep?.();
+
     log.debug(`worker [${id}] waiting for worker to stop...`);
+
     await sleeping;
+
     log.debug(`worker [${id}] shut down`);
   }
 
@@ -157,24 +183,32 @@ export function defineWorker(
 export async function processAll(
   queue: Queue,
   worker: Worker,
-  opts?: { logger?: Logger; timeout?: number }
+  opts?: { logger?: Logger; timeout?: number },
 ) {
   const log = opts?.logger || console;
   const timeout = opts?.timeout ?? 1000;
+
   void worker.start();
+
   const start = Date.now();
+
   await new Promise((resolve) => setTimeout(resolve, 10));
+
   while (
-    queue.countJobs({ status: JobStatus.Pending }) +
-      queue.countJobs({ status: JobStatus.Processing }) >
+    (await queue.countJobs({ status: JobStatus.Pending })) +
+      (await queue.countJobs({ status: JobStatus.Processing })) >
     0
   ) {
     log.debug("waiting for jobs to be processed");
+
     await new Promise((resolve) => setTimeout(resolve, 50));
+
     if (Date.now() - start > timeout) {
       throw new Error("timeout while waiting for all jobs the be processed");
     }
   }
+
   log.debug("all processed, shutting down worker");
+
   await worker.stop();
 }

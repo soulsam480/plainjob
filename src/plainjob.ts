@@ -1,10 +1,8 @@
+export { type Job, JobStatus, type Logger, ScheduledJobStatus } from "./jobs";
 export {
-  bun,
-  better,
-  type Queue,
-  defineQueue,
   type Connection,
+  defineQueue,
+  type Queue,
   type QueueOptions,
 } from "./queue";
-export { type Worker, defineWorker } from "./worker";
-export { type Job, JobStatus, type Logger, ScheduledJobStatus } from "./jobs";
+export { defineWorker, type Worker } from "./worker";
