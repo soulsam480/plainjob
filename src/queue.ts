@@ -1,6 +1,7 @@
 import type { Client } from "@libsql/client";
 import cronParser from "cron-parser";
 import {
+  type Job,
   JobStatus,
   type Logger,
   type PersistedJob,
@@ -91,12 +92,6 @@ export interface Connection {
   close: () => void;
 }
 
-function tapAndLogStatement(stmt: ISQLStatement) {
-  // console.log(`[QUERY]: ${stmt.sql} with ${JSON.stringify(stmt.args)}`);
-
-  return stmt;
-}
-
 export function libsql(database: Client): Connection {
   return {
     driver: "libsql",
@@ -121,27 +116,21 @@ export function libsql(database: Client): Connection {
       return {
         // biome-ignore lint/suspicious/noExplicitAny: this is fine
         async get<T>(...args: any[]) {
-          const res = await database.execute(
-            tapAndLogStatement(stmt.with(...args)),
-          );
+          const res = await database.execute(stmt.with(...args));
 
           return res.rows[0] as unknown as T;
         },
 
         // biome-ignore lint/suspicious/noExplicitAny: this is fine
         async all<T>(...args: any[]) {
-          const res = await database.execute(
-            tapAndLogStatement(stmt.with(...args)),
-          );
+          const res = await database.execute(stmt.with(...args));
 
           return res.rows as unknown as T[];
         },
 
         // biome-ignore lint/suspicious/noExplicitAny: this is fine
         async run(...args: any[]) {
-          const res = await database.execute(
-            tapAndLogStatement(stmt.with(...args)),
-          );
+          const res = await database.execute(stmt.with(...args));
 
           return {
             changes: res.rowsAffected,
@@ -177,6 +166,8 @@ export type QueueOptions = {
   onProcessingJobsRequeued?: (n: number) => void;
   /** A function that serializes job data before storing it in the database. */
   serializer?: (data: unknown) => string;
+  /** Disable maintenance tasks (useful for worker processes). */
+  disableMaintenance?: boolean;
 };
 
 /** A queue of jobs. */
@@ -238,7 +229,7 @@ export type Queue = {
 
 export async function setupQueueDeps(db: Connection) {
   await db.pragma("journal_mode = WAL");
-  await db.pragma("busy_timeout = 5000");
+  await db.pragma("busy_timeout = 30000");
 
   await db.transaction([
     sql`CREATE TABLE IF NOT EXISTS plainjob_jobs (
@@ -289,14 +280,6 @@ export function defineQueue(opts: QueueOptions): Queue {
     DELETE FROM plainjob_jobs
     WHERE status = ${JobStatus.Failed} AND failed_at < ?
   `);
-
-  function initializeMaintenance() {
-    maintenanceTimeout = setInterval(async () => {
-      await queue.requeueTimedOutJobs(jobProcessingTimeout);
-      await queue.removeDoneJobs(removeDoneJobsOlderThan);
-      await queue.removeFailedJobs(removeFailedJobsOlderThan);
-    }, maintenanceInterval);
-  }
 
   const countJobsStmt = db.prepare(sql`SELECT COUNT(*) FROM plainjob_jobs`);
 
@@ -374,27 +357,45 @@ export function defineQueue(opts: QueueOptions): Queue {
     UPDATE plainjob_jobs SET status = ${JobStatus.Pending} WHERE status = ${JobStatus.Processing} AND next_run_at < ?
   `);
 
-  const getJobIdToProcessNextStmt = db.prepare(sql`
-    SELECT id, created_at FROM plainjob_jobs
-    WHERE status = ${JobStatus.Pending} AND type = ? AND next_run_at <= ?
-    ORDER BY next_run_at LIMIT 1
+  const claimJobStmt = db.prepare(sql`
+    UPDATE plainjob_jobs 
+    SET status = ?, next_run_at = ?
+    WHERE id = (
+      SELECT id FROM plainjob_jobs 
+      WHERE status = ? AND type = ? AND next_run_at <= ?
+      ORDER BY next_run_at
+      LIMIT 1
+    )
+    RETURNING id
   `);
 
-  const updateJobAsProcessingStmt = db.prepare(sql`
-    UPDATE plainjob_jobs SET status = ${JobStatus.Processing}, next_run_at = ? WHERE id = ?
+  const getClaimedJobStmt = db.prepare(sql`
+    SELECT id, status, type FROM plainjob_jobs
+    WHERE id = ?
   `);
 
-  const getNextScheduledJobStmt = db.prepare(sql`
+  const claimScheduledJobStmt = db.prepare(sql`
+    UPDATE plainjob_scheduled_jobs 
+    SET status = ?
+    WHERE id = (
+      SELECT id FROM plainjob_scheduled_jobs 
+      WHERE status = ? AND next_run_at <= ?
+      ORDER BY next_run_at
+      LIMIT 1
+    )
+    RETURNING id
+  `);
+
+  const getClaimedScheduledJobStmt = db.prepare(sql`
     SELECT
-      id,
-      type,
-      status,
-      created_at as createdAt,
-      cron_expression as cronExpression,
-      next_run_at as nextRunAt
-    FROM plainjob_scheduled_jobs
-    WHERE status = ${ScheduledJobStatus.Idle} AND next_run_at <= ?
-    ORDER BY next_run_at LIMIT 1
+       id,
+       type,
+       status,
+       created_at as createdAt,
+       cron_expression as cronExpression,
+       next_run_at as nextRunAt
+     FROM plainjob_scheduled_jobs
+     WHERE rowid = ?
   `);
 
   const updateJobStatusStmt = db.prepare(sql`
@@ -526,64 +527,71 @@ export function defineQueue(opts: QueueOptions): Queue {
 
       log.debug(`requeued ${result.changes} timed out jobs`);
 
-      if (opts.onProcessingJobsRequeued) {
-        opts.onProcessingJobsRequeued(result.changes);
-      }
+      opts.onProcessingJobsRequeued?.(result.changes);
     },
     async removeDoneJobs(olderThan: number): Promise<void> {
       const now = Date.now();
       const result = await removeDoneJobsStmt.run(now - olderThan);
+
       log.debug(`removed ${result.changes} done jobs`);
-      if (opts.onDoneJobsRemoved) {
-        opts.onDoneJobsRemoved(result.changes);
-      }
+
+      opts.onDoneJobsRemoved?.(result.changes);
     },
     async removeFailedJobs(olderThan: number): Promise<void> {
       const now = Date.now();
       const result = await removeFailedJobsStmt.run(now - olderThan);
+
       log.debug(`removed ${result.changes} failed jobs`);
-      if (opts.onFailedJobsRemoved) {
-        opts.onFailedJobsRemoved(result.changes);
-      }
+
+      opts.onFailedJobsRemoved?.(result.changes);
     },
     async getAndMarkJobAsProcessing(
       type: string,
     ): Promise<{ id: number } | undefined> {
-      const result = await getJobIdToProcessNextStmt.get<
-        { id: number } | undefined
-      >(type, Date.now());
+      const now = Date.now();
+      const timeout = now + jobProcessingTimeout;
 
-      if (!result?.id) {
-        return undefined;
-      }
-
-      await updateJobAsProcessingStmt.run(
-        Date.now() + jobProcessingTimeout,
-        result.id,
+      const result = await claimJobStmt.run(
+        JobStatus.Processing,
+        timeout,
+        JobStatus.Pending,
+        type,
+        now,
       );
 
-      return result;
+      const updatedRowId = (result.rows[0] as Job)?.id;
+
+      if (updatedRowId === undefined) {
+        return;
+      }
+
+      const job = await getClaimedJobStmt.get<{ id: number }>(updatedRowId);
+
+      return job;
     },
     async getAndMarkScheduledJobAsProcessing(): Promise<
       PersistedScheduledJob | undefined
     > {
       const now = Date.now();
 
-      const job = await getNextScheduledJobStmt.get<
-        PersistedScheduledJob | undefined
-      >(now);
+      const result = await claimScheduledJobStmt.run(
+        ScheduledJobStatus.Processing,
+        ScheduledJobStatus.Idle,
+        now,
+      );
 
-      if (!job) {
+      const updatedRowId = (result.rows[0] as Job)?.id;
+
+      if (updatedRowId === undefined) {
         return;
       }
 
-      await updateScheduledJobStatusStmt.run(
-        ScheduledJobStatus.Processing,
-        job.nextRunAt,
-        job.id,
-      );
+      const job =
+        await getClaimedScheduledJobStmt.get<PersistedScheduledJob>(
+          updatedRowId,
+        );
 
-      return { ...job, status: ScheduledJobStatus.Processing };
+      return job;
     },
     async markJobAsDone(id: number): Promise<void> {
       await updateJobStatusStmt.run(JobStatus.Done, id);
@@ -608,7 +616,18 @@ export function defineQueue(opts: QueueOptions): Queue {
     },
   };
 
-  initializeMaintenance();
+  function initializeMaintenance() {
+    maintenanceTimeout = setInterval(async () => {
+      await queue.requeueTimedOutJobs(jobProcessingTimeout);
+      await queue.removeDoneJobs(removeDoneJobsOlderThan);
+      await queue.removeFailedJobs(removeFailedJobsOlderThan);
+    }, maintenanceInterval);
+  }
+
+  // Only start maintenance if not disabled (for worker processes)
+  if (!opts.disableMaintenance) {
+    initializeMaintenance();
+  }
 
   return queue;
 }

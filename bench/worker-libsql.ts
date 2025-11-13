@@ -1,8 +1,8 @@
 import type { Job, Logger } from "../src/plainjob";
 import { defineQueue, defineWorker } from "../src/plainjob";
-import { libsql, setupQueueDeps } from "../src/queue";
+import { libsql } from "../src/queue";
 import { processAll } from "../src/worker";
-import { createDb } from "./libsql";
+import { createDb } from "./ceeate-db";
 
 const logger: Logger = {
   error: console.error,
@@ -14,9 +14,9 @@ const logger: Logger = {
 async function run() {
   const connection = libsql(createDb());
 
-  await setupQueueDeps(connection);
+  console.log(process.ppid, "PID MY");
 
-  const queue = defineQueue({ connection, logger });
+  const queue = defineQueue({ connection, logger, disableMaintenance: true });
 
   const worker = defineWorker("bench", async (_job: Job) => Promise.resolve(), {
     queue,
@@ -26,6 +26,7 @@ async function run() {
   await processAll(queue, worker, { logger, timeout: 60 * 1000 });
 
   await queue.close();
+
   process.exit(0);
 }
 

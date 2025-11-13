@@ -14,6 +14,7 @@ const logger: Logger = {
 
 async function queueJobs(queue: Queue, count: number) {
   const jobs = [];
+
   for (let i = 0; i < count; i++) {
     jobs.push({ jobId: i });
   }
@@ -27,15 +28,24 @@ export async function runScenario(
   concurrent: number,
   parallel: number,
 ) {
-  await setupQueueDeps(connection);
-
   console.log(
     `running scenario - jobs: ${jobCount}, workers: ${concurrent}, parallel workers: ${parallel}`,
   );
 
+  await connection.exec(
+    "DROP INDEX IF EXISTS idx_jobs_status_type_next_run_at",
+  );
+
+  await connection.exec(
+    "DROP INDEX IF EXISTS idx_scheduled_jobs_status_type_next_run_at",
+  );
+
+  await connection.exec("DROP TABLE IF EXISTS plainjob_jobs");
+  await connection.exec("DROP TABLE IF EXISTS  plainjob_scheduled_jobs");
+
+  await setupQueueDeps(connection);
+
   const queue = defineQueue({ connection, logger });
-  await connection.exec(`DELETE FROM plainjob_jobs`);
-  await connection.exec(`DELETE FROM plainjob_scheduled_jobs`);
 
   await queueJobs(queue, jobCount);
 
@@ -77,7 +87,7 @@ export async function runScenario(
     );
   }
 
-  // await queue.close();
+  await queue.close();
 
   const elapsed = Date.now() - start;
   const jobsPerSecond = jobCount / (elapsed / 1000);

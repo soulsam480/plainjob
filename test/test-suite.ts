@@ -187,8 +187,8 @@ export function getTestSuite(
     it("should requeue timed out jobs", async () => {
       const queue = defineQueue({
         connection,
-        timeout: 200,
-        maintenanceInterval: 150,
+        timeout: 100,
+        maintenanceInterval: 100,
       });
 
       const { id } = await queue.add("test", { value: "timeout test" });
@@ -203,7 +203,7 @@ export function getTestSuite(
       expect(job?.id).toBe(id);
       expect(job?.status).toBe(JobStatus.Processing);
 
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await new Promise((resolve) => setTimeout(resolve, 300));
 
       const requeuedJob = await queue.getJobById(id);
       expect(requeuedJob?.status).toBe(JobStatus.Pending);
