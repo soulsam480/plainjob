@@ -4,3 +4,5 @@ dist
 bench.db*
 test.db*
 coverage
+*.db
+.env

@@ -1,9 +1,11 @@
-import { type ChildProcess, fork } from "node:child_process";
-import path from "node:path";
-import { defineQueue, defineWorker, JobStatus } from "../src/plainjob";
-import type { Job, Logger, Queue } from "../src/plainjob";
-import { processAll } from "../src/worker";
-import { type Connection } from "../src/queue";
+import type { Logger, Queue } from "../src/plainjob";
+import {
+  defineQueue,
+  defineWorker,
+  JobStatus,
+  processAll,
+} from "../src/plainjob";
+import { type Connection, setupQueueDeps } from "../src/queue";
 
 const logger: Logger = {
   error: console.error,
@@ -12,100 +14,88 @@ const logger: Logger = {
   debug: () => {},
 };
 
-function queueJobs(queue: Queue, count: number) {
+async function queueJobs(queue: Queue, count: number) {
   const jobs = [];
+
   for (let i = 0; i < count; i++) {
     jobs.push({ jobId: i });
   }
-  queue.addMany("bench", jobs);
+
+  await queue.addMany("bench", jobs);
 }
 
 export async function runScenario(
   connection: Connection,
   jobCount: number,
-  concurrent: number,
-  parallel: number
+  concurrency: number,
 ) {
   console.log(
-    `running scenario - jobs: ${jobCount}, workers: ${concurrent}, parallel workers: ${parallel}`
+    `running scenario - jobs: ${jobCount}, concurrency: ${concurrency}`,
   );
 
-  const queue = defineQueue({ connection, logger });
-  connection.exec(`DELETE FROM plainjob_jobs`);
-  connection.exec(`DELETE FROM plainjob_scheduled_jobs`);
+  await connection.exec(
+    "DROP INDEX IF EXISTS idx_jobs_status_type_next_run_at",
+  );
 
-  queueJobs(queue, jobCount);
+  await connection.exec(
+    "DROP INDEX IF EXISTS idx_scheduled_jobs_status_type_next_run_at",
+  );
+
+  await connection.exec("DROP TABLE IF EXISTS plainjob_jobs");
+  await connection.exec("DROP TABLE IF EXISTS  plainjob_scheduled_jobs");
+
+  await setupQueueDeps(connection);
+
+  const queue = defineQueue({ connection, logger });
+
+  await queueJobs(queue, jobCount);
 
   const start = Date.now();
 
   const workerPromises: Promise<void>[] = [];
 
-  for (let i = 0; i < concurrent; i++) {
-    const worker = defineWorker(
-      "bench",
-      async (job: Job) => new Promise((resolve) => setTimeout(resolve, 0)),
-      { queue, logger }
-    );
-    workerPromises.push(
-      processAll(queue, worker, { logger, timeout: 60 * 1000 })
-    );
-  }
+  const worker = defineWorker(
+    "bench",
+    new URL("./bench-worker.ts", import.meta.url).toString(),
+    {
+      queue,
+      logger,
+      concurrency: concurrency,
+    },
+  );
 
-  for (let i = 0; i < parallel; i++) {
-    workerPromises.push(spawnWorkerProcess(connection));
-  }
+  workerPromises.push(
+    processAll(queue, worker, { logger, timeout: 60 * 1000 }),
+  );
 
   await Promise.all(workerPromises);
 
-  if (queue.countJobs({ status: JobStatus.Pending }) > 0) {
+  if ((await queue.countJobs({ status: JobStatus.Pending })) > 0) {
     throw new Error(
-      `pending jobs remaining: ${queue.countJobs({
+      `pending jobs remaining: ${await queue.countJobs({
         status: JobStatus.Pending,
-      })}`
-    );
-  }
-  if (queue.countJobs({ status: JobStatus.Processing }) > 0) {
-    throw new Error(
-      `processing jobs remaining: ${queue.countJobs({
-        status: JobStatus.Processing,
-      })}`
+      })}`,
     );
   }
 
-  queue.close();
+  if ((await queue.countJobs({ status: JobStatus.Processing })) > 0) {
+    throw new Error(
+      `processing jobs remaining: ${queue.countJobs({
+        status: JobStatus.Processing,
+      })}`,
+    );
+  }
+
+  await queue.close();
 
   const elapsed = Date.now() - start;
   const jobsPerSecond = jobCount / (elapsed / 1000);
 
-  console.log(`database: ${connection.filename}`);
   console.log(`jobs: ${jobCount}`);
-  console.log(`concurrent workers: ${concurrent}`);
-  console.log(`parallel workers: ${parallel}`);
+  console.log(`parallel workers: ${concurrency}`);
   console.log(`time elapsed: ${elapsed} ms`);
   console.log(`jobs/second: ${jobsPerSecond.toFixed(2)}`);
   console.log("------------------------");
 
   return jobsPerSecond;
-}
-
-function spawnWorkerProcess(connection: Connection): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const workerPath = path.join(
-      process.cwd(),
-      "bench",
-      connection.driver === "bun:sqlite" ? "worker-bun.ts" : "worker-better.ts"
-    );
-    const child: ChildProcess = fork(workerPath, [
-      connection.filename,
-      connection.driver,
-    ]);
-
-    child.on("exit", (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`worker process exited with code ${code}`));
-      }
-    });
-  });
 }
