@@ -13,8 +13,8 @@
   ],
   "scripts": {
     "build": "tsc --noEmit && tsup",
-    "test:libsql": "vitest run test/libsql.test.ts",
-    "bench:libsql": "tsx bench/libsql.ts",
+    "test:libsql": "bun test test/libsql.test.ts",
+    "bench:libsql": "bun run bench/libsql.ts",
     "check": "bun run test:libsql && bun run bench:libsql",
     "publish": "changelogen --publish --release"
   },
@@ -38,8 +38,6 @@
     "@types/bun": "latest",
     "changelogen": "^0.5.5",
     "tsup": "^8.2.4",
-    "tsx": "^4.19.1",
-    "typescript": "^5.5.4",
-    "vitest": "^3.0.0"
+    "typescript": "^5.5.4"
   }
 }

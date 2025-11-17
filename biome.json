@@ -4,12 +4,12 @@
   "files": {
     "includes": [
       "**",
-      "!**/.git/**",
-      "!**/node_modules/**",
-      "!**/dist/**",
-      "!**/.turbo/**",
+      "!**/.git",
+      "!**/node_modules",
+      "!**/dist",
+      "!**/.turbo",
       "!**/tsup.config.bundled*",
-      "!**/coverage/**"
+      "!**/coverage"
     ]
   },
   "linter": {

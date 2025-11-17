@@ -273,7 +273,7 @@ export function defineQueue(opts: QueueOptions): Queue {
 
   const removeDoneJobsStmt = db.prepare(sql`
     DELETE FROM plainjob_jobs
-    WHERE status = ${JobStatus.Done} AND created_at < ?
+    WHERE status = ${JobStatus.Done} AND next_run_at < ?
   `);
 
   const removeFailedJobsStmt = db.prepare(sql`

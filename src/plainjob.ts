@@ -5,4 +5,4 @@ export {
   type Queue,
   type QueueOptions,
 } from "./queue";
-export { defineWorker, type Worker } from "./worker";
+export { defineWorker, processAll, type Worker } from "./worker";

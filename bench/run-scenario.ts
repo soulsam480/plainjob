@@ -1,9 +1,11 @@
-import { type ChildProcess, fork } from "node:child_process";
-import path from "node:path";
-import type { Job, Logger, Queue } from "../src/plainjob";
-import { defineQueue, defineWorker, JobStatus } from "../src/plainjob";
+import type { Logger, Queue } from "../src/plainjob";
+import {
+  defineQueue,
+  defineWorker,
+  JobStatus,
+  processAll,
+} from "../src/plainjob";
 import { type Connection, setupQueueDeps } from "../src/queue";
-import { processAll } from "../src/worker";
 
 const logger: Logger = {
   error: console.error,
@@ -25,11 +27,10 @@ async function queueJobs(queue: Queue, count: number) {
 export async function runScenario(
   connection: Connection,
   jobCount: number,
-  concurrent: number,
-  parallel: number,
+  concurrency: number,
 ) {
   console.log(
-    `running scenario - jobs: ${jobCount}, workers: ${concurrent}, parallel workers: ${parallel}`,
+    `running scenario - jobs: ${jobCount}, concurrency: ${concurrency}`,
   );
 
   await connection.exec(
@@ -53,21 +54,19 @@ export async function runScenario(
 
   const workerPromises: Promise<void>[] = [];
 
-  for (let i = 0; i < concurrent; i++) {
-    const worker = defineWorker(
-      "bench",
-      async (_job: Job) => new Promise((resolve) => setTimeout(resolve, 0)),
-      { queue, logger },
-    );
+  const worker = defineWorker(
+    "bench",
+    new URL("./bench-worker.ts", import.meta.url).toString(),
+    {
+      queue,
+      logger,
+      concurrency: concurrency,
+    },
+  );
 
-    workerPromises.push(
-      processAll(queue, worker, { logger, timeout: 60 * 1000 }),
-    );
-  }
-
-  for (let i = 0; i < parallel; i++) {
-    workerPromises.push(spawnWorkerProcess(connection));
-  }
+  workerPromises.push(
+    processAll(queue, worker, { logger, timeout: 60 * 1000 }),
+  );
 
   await Promise.all(workerPromises);
 
@@ -93,35 +92,10 @@ export async function runScenario(
   const jobsPerSecond = jobCount / (elapsed / 1000);
 
   console.log(`jobs: ${jobCount}`);
-  console.log(`concurrent workers: ${concurrent}`);
-  console.log(`parallel workers: ${parallel}`);
+  console.log(`parallel workers: ${concurrency}`);
   console.log(`time elapsed: ${elapsed} ms`);
   console.log(`jobs/second: ${jobsPerSecond.toFixed(2)}`);
   console.log("------------------------");
 
   return jobsPerSecond;
-}
-
-const WORKER_MAPPING: Record<string, string> = {
-  libsql: "worker-libsql.ts",
-};
-
-function spawnWorkerProcess(connection: Connection): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const workerPath = path.join(
-      process.cwd(),
-      "bench",
-      WORKER_MAPPING[connection.driver] ?? "",
-    );
-
-    const child: ChildProcess = fork(workerPath, [connection.driver]);
-
-    child.on("exit", (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`worker process exited with code ${code}`));
-      }
-    });
-  });
 }
