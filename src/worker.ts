@@ -1,12 +1,11 @@
 import cronParser from "cron-parser";
 import { JobStatus, type Job, type Logger, type PersistedJob } from "./jobs";
 import type { Queue } from "./queue";
-
-/** Function that processes a job and optionally returns a promise. */
-type JobProcessor = (job: Job) => Promise<void> | void;
+import type { WorkerMessage } from "./base-worker";
+import Worker from "web-worker";
 
 /** A worker that processes jobs from a queue. */
-export type Worker = {
+export type JobWorker = {
   /** Start the worker, processing jobs one by one. Returns a promise that resolves when the worker is stopped. */
   start: () => Promise<void>;
   /** Stop the worker gracefully, waiting for the current job to finish. */
@@ -30,9 +29,9 @@ type WorkerOptions = {
 
 export function defineWorker(
   jobType: string,
-  processor: JobProcessor,
+  workerPath: string,
   options: WorkerOptions
-): Worker {
+): JobWorker {
   const log = options.logger || console;
   const id = Math.random().toString(36).substring(2, 15);
   const pollInterval = options.pollIntervall ?? 1000;
@@ -41,9 +40,9 @@ export function defineWorker(
   let isRunning = true;
   let cancelSleep: (() => void) | undefined;
   let sleeping: Promise<void> | undefined;
+  let webWorker: any;
 
   async function processScheduledJobs() {
-    log.debug(`worker [${id}] checking for scheduled jobs`);
     const scheduledJob = queue.getAndMarkScheduledJobAsProcessing();
     if (scheduledJob) {
       log.debug(
@@ -69,7 +68,6 @@ export function defineWorker(
   }
 
   async function processRegularJobs() {
-    log.debug(`worker [${id}] checking for regular jobs`);
     const jobId = queue.getAndMarkJobAsProcessing(jobType);
     if (jobId) {
       const job = queue.getJobById(jobId.id) as PersistedJob;
@@ -80,8 +78,9 @@ export function defineWorker(
       log.debug(
         `worker [${id}] processing job ${job.id}, ${job.type}, ${job.data}`
       );
+      
       try {
-        await processor({ id: job.id, data: job.data, type: job.type });
+        await processJobWithWorker(job);
         queue.markJobAsDone(job.id);
         if (options.onCompleted) {
           options.onCompleted(job);
@@ -102,7 +101,54 @@ export function defineWorker(
     return false;
   }
 
+  async function processJobWithWorker(job: PersistedJob): Promise<void> {
+    if (!webWorker) {
+      webWorker = new Worker(workerPath);
+    }
+
+    const currentWorker = webWorker;
+
+    return new Promise<void>((resolve, reject) => {
+      const handleMessage = (event: MessageEvent<WorkerMessage>) => {
+        switch (event.data.type) {
+          case "JOB_COMPLETE":
+            if (event.data.jobId === job.id) {
+              currentWorker.removeEventListener("message", handleMessage);
+              currentWorker.removeEventListener("error", handleError);
+              resolve();
+            }
+            break;
+          case "JOB_FAILED":
+            if (event.data.jobId === job.id) {
+              currentWorker.removeEventListener("message", handleMessage);
+              currentWorker.removeEventListener("error", handleError);
+              reject(new Error(event.data.error));
+            }
+            break;
+        }
+      };
+
+      const handleError = (error: ErrorEvent) => {
+        currentWorker.removeEventListener("message", handleMessage);
+        currentWorker.removeEventListener("error", handleError);
+        reject(new Error(`Worker error: ${error.message || error}`));
+      };
+
+      currentWorker.addEventListener("message", handleMessage);
+      currentWorker.addEventListener("error", handleError);
+
+      currentWorker.postMessage({
+        type: "PROCESS_JOB",
+        jobId: job.id,
+        jobType: job.type,
+        jobData: job.data,
+      });
+    });
+  }
+
   async function start() {
+    log.info("worker [${id}] starting...");
+
     try {
       shouldKeepRunning = true;
       while (shouldKeepRunning) {
@@ -140,6 +186,9 @@ export function defineWorker(
     if (cancelSleep) {
       cancelSleep();
     }
+    if (webWorker) {
+      webWorker.terminate();
+    }
     log.debug(`worker [${id}] waiting for worker to stop...`);
     await sleeping;
     log.debug(`worker [${id}] shut down`);
@@ -156,7 +205,7 @@ export function defineWorker(
  * This will hang until timeout of worker is not processing all job types in queue. */
 export async function processAll(
   queue: Queue,
-  worker: Worker,
+  worker: JobWorker,
   opts?: { logger?: Logger; timeout?: number }
 ) {
   const log = opts?.logger || console;

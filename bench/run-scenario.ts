@@ -43,7 +43,7 @@ export async function runScenario(
   for (let i = 0; i < concurrent; i++) {
     const worker = defineWorker(
       "bench",
-      async (job: Job) => new Promise((resolve) => setTimeout(resolve, 0)),
+      "./bench/workers/bench-worker.js",
       { queue, logger }
     );
     workerPromises.push(

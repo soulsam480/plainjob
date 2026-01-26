@@ -21,7 +21,7 @@ if (!filename) {
 const connection = better(new Database(filename));
 
 const queue = defineQueue({ connection, logger });
-const worker = defineWorker("bench", async (job: Job) => Promise.resolve(), {
+const worker = defineWorker("bench", "./bench/workers/bench-worker.js", {
   queue,
   logger,
 });

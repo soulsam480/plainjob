@@ -21,7 +21,7 @@ if (!filename) {
 const connection = bun(new Bun(filename, { strict: true }));
 
 const queue = defineQueue({ connection, logger });
-const worker = defineWorker("bench", async (job: Job) => Promise.resolve(), {
+const worker = defineWorker("bench", "./bench/workers/bench-worker.js", {
   queue,
   logger,
 });

@@ -5,6 +5,7 @@ import {
   ScheduledJobStatus,
 } from "../src/plainjob";
 import type { Job } from "../src/plainjob";
+import type { PersistedJob } from "../src/jobs";
 import { processAll } from "../src/worker";
 import type { Connection } from "../src/queue";
 import type { Expect } from "bun:test";
@@ -436,10 +437,13 @@ export function getTestSuite(
       const results: unknown[] = [];
       const worker = defineWorker(
         "test",
-        async (job: Job) => {
-          results.push(JSON.parse(job.data));
-        },
-        { queue }
+        "./test/workers/test-worker.ts",
+        { 
+          queue,
+          onCompleted: (job) => {
+            results.push(JSON.parse(job.data));
+          }
+        }
       );
 
       queue.add("test", { value: 1 });
@@ -455,15 +459,20 @@ export function getTestSuite(
       const results: unknown[] = [];
       const worker = defineWorker(
         "scheduled",
-        async (job: Job) => {
-          results.push(JSON.parse(job.data));
-        },
-        { queue }
+        "./test/workers/scheduled-worker.ts",
+        { 
+          queue,
+          onCompleted: (job) => {
+            results.push(job.data ? JSON.parse(job.data) : {});
+          }
+        }
       );
 
       queue.schedule("scheduled", { cron: "* * * * *" });
 
       worker.start();
+      // Give time for scheduled job to be processed
+      await new Promise(resolve => setTimeout(resolve, 1100));
       await worker.stop();
 
       expect(results[0]).toEqual({});
@@ -480,7 +489,7 @@ export function getTestSuite(
       expect(job?.type).toBe("paint");
       expect(JSON.parse(job?.data as string)).toEqual({ color: "blue" });
 
-      const worker = defineWorker("paint", async (job: Job) => {}, { queue });
+      const worker = defineWorker("paint", "./test/workers/paint-worker.ts", { queue });
 
       await processAll(queue, worker);
 
@@ -511,10 +520,13 @@ export function getTestSuite(
       const results: unknown[] = [];
       const worker = defineWorker(
         "test",
-        async (job: Job) => {
-          results.push(JSON.parse(job.data));
-        },
-        { queue }
+        "./test/workers/test-worker.ts",
+        { 
+          queue,
+          onCompleted: (job) => {
+            results.push(JSON.parse(job.data));
+          }
+        }
       );
 
       await processAll(queue, worker);
@@ -529,9 +541,7 @@ export function getTestSuite(
 
       const worker = defineWorker(
         "test",
-        async (job: Job) => {
-          throw new Error("test error");
-        },
+        "./test/workers/error-worker.ts",
         { queue }
       );
 
@@ -549,31 +559,39 @@ export function getTestSuite(
       const queue = defineQueue({ connection });
 
       const { id } = queue.schedule("paint", { cron: "* * * * * *" });
+      let actualFailedJob: PersistedJob | undefined;
+      let actualFailedError: string | undefined;
 
       const worker = defineWorker(
         "paint",
-        async (job: Job) => {
-          throw new Error("test error");
-        },
-        { queue }
+        "./test/workers/error-worker.ts",
+        { 
+          queue,
+          onFailed: (job: Job, error: string) => {
+            actualFailedJob = job as PersistedJob;
+            actualFailedError = error;
+          }
+        }
       );
 
       worker.start();
+      // Give time for the derived job to be processed
+      await new Promise(resolve => setTimeout(resolve, 1200));
       await worker.stop();
 
-      const failedJob = queue.getJobById(id);
-      expect(failedJob).toBeDefined();
-      expect(failedJob?.status).toBe(JobStatus.Failed);
-      expect(failedJob?.failedAt).toBeDefined();
-      expect(failedJob?.error).toContain("test error");
-      expect(failedJob?.failedAt).not.toBeNull();
+      const failedJobFromQueue = queue.getJobById(id);
+      expect(failedJobFromQueue).toBeDefined();
+      expect(failedJobFromQueue?.status).toBe(JobStatus.Failed);
+      expect(failedJobFromQueue?.failedAt).toBeDefined();
+      expect(failedJobFromQueue?.error).toContain("test error");
+      expect(failedJobFromQueue?.failedAt).not.toBeNull();
     });
 
     it("should call onProcessing when a job starts processing", async () => {
       const queue = defineQueue({ connection });
       let processingCalled = false;
 
-      const worker = defineWorker("test", async (job: Job) => {}, {
+      const worker = defineWorker("test", "./test/workers/test-worker.ts", {
         queue,
         onProcessing: (job: Job) => {
           processingCalled = true;
@@ -590,7 +608,7 @@ export function getTestSuite(
       const queue = defineQueue({ connection });
       let completedJob!: Job;
 
-      const worker = defineWorker("test", async (job: Job) => {}, {
+      const worker = defineWorker("test", "./test/workers/test-worker.ts", {
         queue,
         onCompleted: (job: Job) => {
           completedJob = job;
@@ -612,9 +630,7 @@ export function getTestSuite(
 
       const worker = defineWorker(
         "test",
-        async (job: Job) => {
-          throw new Error("Test error");
-        },
+        "./test/workers/error-worker.ts",
         {
           queue,
           onFailed: (job: Job, error: string) => {
@@ -628,7 +644,7 @@ export function getTestSuite(
       await processAll(queue, worker);
 
       expect(JSON.parse(failedJob.data)).toEqual({ value: "failed test" });
-      expect(failedError).toContain("Test error");
+      expect(failedError).toContain("test error");
     });
 
     it("should delay job execution", async () => {
@@ -636,10 +652,13 @@ export function getTestSuite(
       const results: unknown[] = [];
       const worker = defineWorker(
         "delayed",
-        async (job: Job) => {
-          results.push(JSON.parse(job.data));
-        },
-        { queue }
+        "./test/workers/test-worker.ts",
+        { 
+          queue,
+          onCompleted: (job) => {
+            results.push(JSON.parse(job.data));
+          }
+        }
       );
 
       const delay = 20;
